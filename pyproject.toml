@@ -1,0 +1,17 @@
+[project]
+name = "reassemble"
+version = "0.1.0"
+description = "Digital reconstruction of shredded documents"
+requires-python = ">=3.11"
+
+[project.scripts]
+reassemble = "reassemble.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["reassemble*"]
+
+[tool.setuptools.package-data]
+reassemble = ["synth/fonts/*", "verify/wordlists/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

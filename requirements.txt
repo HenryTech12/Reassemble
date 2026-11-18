@@ -1,0 +1,12 @@
+numpy>=1.26
+opencv-python-headless>=4.9
+scikit-image>=0.22
+scipy>=1.11
+scikit-learn>=1.4
+pillow>=10.2
+pytesseract>=0.3.10
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+pytest>=8
+# torch is installed separately (CPU wheel) by `make setup`
