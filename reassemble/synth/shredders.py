@@ -58,16 +58,19 @@ def _random_walk(n: int, max_amp: float, rng: np.random.Generator, smooth: float
     return np.clip(walk + jitter, 0, max_amp)
 
 
-def fray_mask(h: int, w: int, depth: int, rng: np.random.Generator) -> np.ndarray:
-    """Alpha mask for a strip whose left/right edges lost up to ``depth`` px irregularly."""
-    mask = np.full((h, w), 255, np.uint8)
-    if depth <= 0:
-        return mask
-    left = _random_walk(h, depth, rng)
-    right = _random_walk(h, depth, rng)
-    xs = np.arange(w)[None, :]
-    mask[(xs < left[:, None]) | (xs >= w - right[:, None])] = 0
-    return mask
+def ragged_cuts(xs: np.ndarray, h: int, depth: int, rng: np.random.Generator) -> np.ndarray:
+    """Per-row x position of every cut line: shape (len(xs), h).
+
+    A blade (or a tear) doesn't destroy paper, it *divides* it: if strip A bulges out by
+    2 px at some row, strip B is missing exactly those 2 px.  So each internal cut is one
+    shared wavy curve and the two neighbours get complementary boundaries.  The page's own
+    left and right borders stay straight.
+    """
+    cuts = np.repeat(xs[:, None].astype(np.float64), h, axis=1)
+    if depth > 0:
+        for k in range(1, len(xs) - 1):
+            cuts[k] += _random_walk(h, depth, rng) - depth / 2
+    return np.round(cuts).astype(int)
 
 
 def degrade(rgba: np.ndarray, r: Realism, rng: np.random.Generator, rotate: bool = True) -> np.ndarray:
@@ -77,7 +80,12 @@ def degrade(rgba: np.ndarray, r: Realism, rng: np.random.Generator, rotate: bool
     if r.brightness:
         rgb *= 1.0 + rng.uniform(-r.brightness, r.brightness)
     if r.blur_sigma:
-        rgb = cv2.GaussianBlur(rgb, (0, 0), r.blur_sigma)
+        # normalised convolution: blur the paper content without smearing in the
+        # transparent (non-paper) surroundings
+        w = (a[..., 0] > 0).astype(np.float32)
+        num = cv2.GaussianBlur(rgb * w[..., None], (0, 0), r.blur_sigma)
+        den = cv2.GaussianBlur(w, (0, 0), r.blur_sigma)[..., None]
+        rgb = np.where(den > 1e-3, num / np.maximum(den, 1e-3), rgb)
     if r.noise_sigma:
         rgb += rng.normal(0, r.noise_sigma, rgb.shape)
     rgb = np.clip(rgb, 0, 255)
@@ -137,11 +145,15 @@ def strip_shred(page: np.ndarray, n: int = 30, realism: Realism | None = None, s
     nrng = np.random.default_rng(seed)
     h, w = page.shape[:2]
     xs = cut_positions(w, n, r.width_jitter, nrng)
+    cuts = ragged_cuts(xs, h, r.fray_px, nrng)
     ids = _ids(n, rng, id_prefix)
+    cols = np.arange(w)[None, :]
     pieces = []
     for i in range(n):
-        a, b = xs[i], xs[i + 1]
-        mask = fray_mask(h, b - a, r.fray_px, nrng)
+        lo, hi = cuts[i], cuts[i + 1]
+        a, b = int(lo.min()), int(hi.max())
+        full = (cols >= lo[:, None]) & (cols < hi[:, None])
+        mask = np.where(full[:, a:b], 255, 0).astype(np.uint8)
         front = to_rgba(page[:, a:b])
         front[..., 3] = mask
         p = Piece(id=ids[i], image=degrade(front, r, nrng))
@@ -155,7 +167,7 @@ def strip_shred(page: np.ndarray, n: int = 30, realism: Realism | None = None, s
     kept = [p for p in pieces if p.id not in missing]
     rng.shuffle(kept)
     truth = {"kind": "strip", "n": n, "order": order, "missing": missing,
-             "cuts": xs.tolist(), "page_size": [h, w], "realism": r.to_dict(),
+             "cuts": xs.tolist(), "piece_x": {ids[i]: int(cuts[i].min()) for i in range(n)}, "page_size": [h, w], "realism": r.to_dict(),
              "double_sided": back is not None}
     return kept, truth
 

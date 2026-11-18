@@ -17,3 +17,9 @@ demo-synth:
 
 clean:
 	rm -rf $(SAMPLES) result results
+
+bench:
+	$(PY) -m reassemble.cli bench
+
+demo-solve: demo-synth
+	$(PY) -m reassemble.cli solve $(SAMPLES)/memo_30_noisy --out result/memo_30_noisy
