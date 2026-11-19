@@ -27,3 +27,9 @@ demo-solve: demo-synth
 
 train:
 	$(PY) -m reassemble.cli train
+
+api:
+	$(PY) -m uvicorn api.main:app --reload --port 8000
+
+web:
+	cd web && npm install && npm run dev

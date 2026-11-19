@@ -247,7 +247,10 @@ def join_min_marginals(M: np.ndarray, tour: list[int], return_tours: bool = Fals
     We approximate the re-solve with the local search above, warm-started from the
     current tour.
     """
-    base = tour_cost(M, tour)
+    # Measure against the best *nearby* tour, not the given one: after a manual edit the
+    # given tour may be far from optimal, and then banning any join would look like an
+    # improvement (every confidence would collapse to 0).
+    base = min(tour_cost(M, tour), tour_cost(M, or_opt_2opt(M, tour)))
     out, tours = [], []
     for k in range(len(tour)):
         a, b = tour[k], tour[(k + 1) % len(tour)]

@@ -35,7 +35,8 @@ reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR re
 | 3 | Learned CNN edge matcher (+ fine-tuning from human corrections) | ✅ |
 | 4 | Cross-cut 2D solver, torn-paper shape matching, handwriting/photos | ✅ (cross-cut: partial) |
 | 5 | Real-world capture (photo → pieces), capture mat, simulated test photo | ✅ |
-| 6–8 | web app, product angles, polish | in progress |
+| 6 | FastAPI + WebSocket backend, Next.js editor with heatmap, replay, constrained re-solve, collaboration | ✅ |
+| 7–8 | product angles, polish | in progress |
 
 ## How it works (strip shreds)
 
@@ -306,6 +307,53 @@ generator's 100 dpi, letter strokes are about 2 px wide, and any real capture lo
 1 px at each cut, so accuracy collapsed to about 0.1. Capturing at 2× (still below a
 typical phone photo or a 300-dpi flatbed scan) brought it to about 0.8.
 
+## Phase 6: web app and human in the loop
+
+```bash
+make api    # FastAPI on :8000   (OpenAPI docs at /docs)
+make web    # Next.js on :3000   (set NEXT_PUBLIC_API_URL if the API is elsewhere)
+```
+
+![editor](assets/screenshot_editor.png)
+
+**Backend** (`api/main.py`). You can upload piece images or one photo (which is segmented
+by the capture pipeline), or start from a sample. Each job solves in a worker thread and
+streams solver progress over `/ws/jobs/{id}`. Edits go through REST:
+
+* `POST /order`: a manual reorder. Join costs and confidences are recomputed with the
+  cached cost matrix.
+* `POST /resolve`: lock or split joins, then **re-solve the rest with those constraints
+  fixed**. Locked pairs are compiled into the ATSP matrix, so every solver respects them.
+* `POST /move_doc`: move a piece to another document, then re-solve the documents.
+* `GET /ocr`: text with dictionary flags.
+* `GET /replay.gif`: the shareable animation.
+* `GET /corrections`: locks and splits as training pairs for `reassemble finetune`.
+
+**Collaboration.** Every edit is stamped with a server-side `seq` and broadcast to
+everyone, and clients drop any state older than the one they hold (last write wins, in
+server order). Cursors and live drag previews are relayed over the same socket, and the
+header shows who is online. Open the share link in two windows to try it.
+
+**Frontend** (`web/`, Next.js App Router + TypeScript + Tailwind):
+* upload / try-a-sample screen;
+* the reconstruction board, with seams coloured by confidence (toggleable): green sure,
+  yellow unsure, red doubtful or gap, blue locked;
+* drag strips to reorder; click a seam to lock or split it; undo/redo with Ctrl+Z;
+* a ▶ Replay animation of the pieces flying from a pile into place in solve order, plus a
+  GIF export;
+* a tab per document for mixed bins, with "move to" for the selected piece;
+* an OCR panel with uncertain words highlighted. In the screenshot below, one strip was
+  dragged to the wrong place on purpose: its seams turn red and the OCR panel flags the
+  garbled words.
+
+![editor after a bad edit](assets/screenshot_editor_edited.png)
+
+On screens narrower than 768 px the board is read-only.
+
+An end-to-end browser test (Playwright, two simulated users) covered: load a sample, solve,
+see both users online, drag a strip, read OCR, lock a seam and re-solve. It produced no
+console errors.
+
 ## Known limitations (honest list)
 
 * **Blank strips** can't be ordered. They are placed at the margins, but which blank strip
@@ -322,6 +370,9 @@ typical phone photo or a 300-dpi flatbed scan) brought it to about 0.8.
   rotation drops accuracy to about 0.6. (Strips are deskewed by PCA; torn pieces have no
   long axis to deskew by.)
 * **Cross-cut beyond about 6×5 pieces** is mostly wrong (see the table above).
+* **Web editor**: dragging, locking and splitting are implemented for strip shreds. Cross-cut
+  and torn results are shown read-only. Jobs live in server memory (plus `runs/` on disk)
+  and don't survive an API restart.
 * **Capture** assumes strips are laid roughly upright (within ±45°). A strip that is upside
   down can't be told apart, and capture is not yet tuned on real photos; the mat, threshold
   and erosion values were chosen on simulated ones.
