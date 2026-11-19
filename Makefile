@@ -1,7 +1,7 @@
 PY ?= .venv/bin/python
 SAMPLES ?= samples
 
-.PHONY: setup test demo demo-synth api web clean
+.PHONY: setup test demo demo-synth demo-solve bench train api web docker clean
 
 setup:
 	uv venv --python 3.12 .venv
@@ -33,3 +33,9 @@ api:
 
 web:
 	cd web && npm install && npm run dev
+
+demo:
+	$(PY) -m reassemble.demo
+
+docker:
+	docker compose up --build

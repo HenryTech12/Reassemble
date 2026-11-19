@@ -57,5 +57,8 @@ def replay_frames(pieces: dict[str, Piece], rec: Reconstruction, scale: float = 
 def save_replay_gif(pieces: dict[str, Piece], rec: Reconstruction, path: str | Path, **kw) -> Path:
     frames = replay_frames(pieces, rec, **kw)
     path = Path(path)
-    frames[0].save(path, save_all=True, append_images=frames[1:], duration=60, loop=0, optimize=True)
+    # a shared 64-colour palette keeps the GIF small enough to embed in a README
+    pal = frames[-1].quantize(colors=64, method=Image.Quantize.MEDIANCUT)
+    q = [f.quantize(palette=pal, dither=Image.Dither.NONE) for f in frames]
+    q[0].save(path, save_all=True, append_images=q[1:], duration=60, loop=0, optimize=True)
     return path

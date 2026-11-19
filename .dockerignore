@@ -1,0 +1,7 @@
+.venv
+samples
+result
+runs
+pieces
+web
+**/__pycache__

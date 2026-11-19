@@ -1,29 +1,83 @@
 # Reassemble
 
-Reassemble takes scans or photos of shredded paper and rebuilds the original document
-digitally. Under the hood it uses computer vision to score how well piece edges fit, a
-combinatorial solver to order the pieces, and OCR to check the result. A web editor lets a
-person correct what the solver gets wrong. The idea comes from the 2011 DARPA Shredder
-Challenge.
+<img src="assets/replay.gif" align="right" width="200" alt="pieces flying into place">
 
-> **Ethics.** Reassemble is meant for recovering your own documents, testing your
-> organisation's shredders, archive work and teaching. Don't use it on documents you have
-> no right to access.
+Reassemble takes scans or photos of shredded paper and rebuilds the original document
+digitally. It works like the document-restoration rig in *The Blacklist*, but for real, and
+the idea comes from the 2011 DARPA Shredder Challenge. Under the hood it uses computer
+vision to score how well piece edges fit (handcrafted *and* a small CNN), a combinatorial
+solver to order the pieces, and OCR to check the result. A collaborative web editor lets
+people fix what the solver gets wrong.
+
+**Headline numbers** (all on synthetic pages with known ground truth; see the tables below):
+
+* Strip-cut, 30 strips, realistic scan noise: **100 %** of non-blank neighbours correct
+  with the learned matcher (96 % handcrafted).
+* Strips photographed on the capture mat and segmented automatically: **100 %** of pieces
+  found, 83 % of neighbours correct.
+* Mixed bins of 3 shredded pages: **95 %** clustering purity.
+* Torn paper (upright pieces): **100 %**. Cross-cut: good up to about 4×3 pieces, poor
+  beyond that (honest table below).
+
+> **Ethics.** Reassemble is for recovering your own documents, testing your organisation's
+> shredders, archives and education. Don't use it on documents you have no right to access.
+
+<br clear="right">
 
 ## Quick start
 
 ```bash
-make setup          # venv + Python deps (needs `uv`; also: sudo apt-get install tesseract-ocr)
-make test           # run the test suite
-make demo-synth     # generate every synthetic test case into samples/
-reassemble solve samples/memo_30_noisy --out result/   # or: python -m reassemble.cli solve ...
-reassemble bench    # accuracy benchmark (--suite strips|mixed|double|ocr|crosscut|torn|scorers)
-reassemble train    # retrain the CNN edge matcher (~2.5 min on CPU)
-reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR rerank
+make setup          # venv + Python deps + CPU PyTorch (needs `uv`; also: sudo apt-get install tesseract-ocr)
+make demo           # shred a letter, solve it, open result/demo/index.html
+make test           # 57 tests, ~1 min
+make api            # FastAPI on :8000      ┐  then open http://localhost:3000
+make web            # Next.js on :3000      ┘  and press "Try" on a sample
+make docker         # or: both services via docker compose
 ```
 
-`solve` writes `reconstruction.png`, `heatmap.png` (joins coloured by confidence) and
-`result.json`.
+Command-line tour (`reassemble …` once installed, or `python -m reassemble.cli …`):
+
+```bash
+reassemble synth --out samples                       # every synthetic test case (= make demo-synth)
+reassemble solve samples/memo_30_noisy --out result/ # reconstruction.png, heatmap.png, result.json
+reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR rerank
+reassemble synth-photo --out samples/photo           # a simulated phone photo of strips on the mat
+reassemble capture samples/photo/photo.jpg --out pieces/ && reassemble solve pieces/
+reassemble audit samples/letter_30_noisy --out result/audit.pdf   # shredder security report
+reassemble archive <dir-of-bins> --out result/archive             # batch mode + dashboard
+reassemble bench --suite strips|mixed|double|ocr|crosscut|torn|scorers|capture
+reassemble train                                     # retrain the CNN (~2.5 min on CPU)
+reassemble finetune corrections.json                 # learn from editor corrections
+reassemble mat                                       # printable capture mat PDF
+```
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph input[Input]
+    P[photo / scan<br/>on capture mat] --> CAP[capture<br/>ArUco rectify · flat-field<br/>segment · watershed · deskew]
+    S[synthetic generator<br/>pages + shredders] --> PCS
+    CAP --> PCS[(Pieces<br/>RGBA + alpha mask)]
+  end
+  PCS --> CL{mixed bin?<br/>cluster by<br/>line layout + paper}
+  CL --> FE[features<br/>deskew · edge columns<br/>white balance · sharpen]
+  FE --> M1[handcrafted cost<br/>prediction-based seam]
+  FE --> M2[learned cost<br/>seam-patch CNN]
+  M1 & M2 --> SOL[solvers<br/>greedy · beam · ATSP Or-opt/2-opt<br/>grid placer · torn assembler]
+  SOL --> V[verify<br/>min-marginal confidence<br/>gap detection · OCR rerank]
+  V --> R[(Reconstruction JSON)]
+  R --> API[FastAPI + WebSocket]
+  API <--> WEB[Next.js editor<br/>heatmap · drag · lock/split<br/>replay · OCR · collaboration]
+  WEB -- locks / splits --> SOL
+  WEB -- corrections --> FT[finetune CNN] --> M2
+  R --> PROD[audit PDF · archive PDFs]
+```
+
+Every stage passes the same small data model (`reassemble/model.py`). A `Piece` is an id,
+an RGBA image (alpha = paper mask, so ragged and torn edges just work), an optional back
+side and metadata. A `Reconstruction` is the order or grid, per-join confidence, gaps and
+scores. Everything serialises to JSON for the API.
 
 ## Status
 
@@ -37,7 +91,7 @@ reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR re
 | 5 | Real-world capture (photo → pieces), capture mat, simulated test photo | ✅ |
 | 6 | FastAPI + WebSocket backend, Next.js editor with heatmap, replay, constrained re-solve, collaboration | ✅ |
 | 7 | Shredder security audit (PDF report), archive batch mode | ✅ |
-| 8 | Polish: README, `make demo`, Docker | in progress |
+| 8 | Polish: README, `make demo`, Docker, tests (88 % coverage; core engine modules 90–100 %) | ✅ |
 
 ## How it works (strip shreds)
 
@@ -385,6 +439,20 @@ reported and skipped; it doesn't stop the run.
 
 ![archive dashboard](assets/screenshot_archive.png)
 
+## Phase 8: polish
+
+* `make demo` shreds a letter into 30 noisy strips, solves it, and writes
+  `result/demo/index.html` with the replay GIF, the reconstruction, the heatmap and the
+  original. It opens the page if a browser is available.
+* `docker compose up --build` starts the API (Python 3.12 slim + Tesseract + CPU PyTorch,
+  with the samples pre-generated) and the web app (Next.js standalone build).
+  `docker compose config` validates, but **the images were not built in the development
+  environment** because it had no Docker daemon. Treat the Dockerfiles as untested.
+* Tests: 57 pytest tests, 88 % line coverage overall. Core-engine modules are at 90–100 %;
+  the lowest are `solve/grid.py` (78 %) and the CLI (76 %). The suite covers the
+  generator, every solver, the CNN (a training smoke test), capture, the API (via
+  `TestClient`, including WebSockets), the audit/archive features and every CLI command.
+
 ## Known limitations (honest list)
 
 * **Blank strips** can't be ordered. They are placed at the margins, but which blank strip
@@ -424,11 +492,17 @@ reassemble/
   verify/     Tesseract OCR readability, reranking, word lists (en, pcm, yo)
   cluster/    mixed-bin document separation
   capture/    photo -> pieces (ArUco rectification, flat-field, watershed, edge repair), mat PDF
-  render/     assembled image + confidence heatmap
-  metrics.py  neighbour / direct accuracy, gap precision/recall
+  render/     assembled image, confidence heatmap, replay GIF
+  product/    shredder security audit (PDF), archive batch mode (PDF + dashboard)
+  metrics.py  neighbour / direct accuracy, gap precision/recall, mixed-bin purity
   pipeline.py prepare -> score -> solve -> Reconstruction
-  cli.py      `reassemble synth | solve | bench`
-tests/
+  bench.py    every benchmark quoted in this README
+  cli.py      `reassemble ...` commands
+api/          FastAPI + WebSocket server
+web/          Next.js editor (App Router, TypeScript, Tailwind)
+models/       trained CNN weights (edge_cnn.pt, 300 KB)
+assets/       capture mat PDF, screenshots, replay GIF
+tests/        pytest suite
 ```
 
 ## Credits & references
@@ -437,5 +511,14 @@ tests/
 * D. Pomeranz, M. Shemesh, O. Ben-Shahar, "A fully automated greedy square jigsaw puzzle
   solver", CVPR 2011.
 * A. Gallagher, "Jigsaw puzzles with pieces of unknown orientation", CVPR 2012.
-* T. Paixão et al., deep-learning reconstruction of strip-shredded documents (2018–2020).
+* T. M. Paixão et al., "A deep learning-based compatibility score for reconstruction of
+  strip-shredded text documents" (SIBGRAPI 2018), and follow-up work on self-supervised
+  and cross-cut reconstruction (2019–2020). The early-fusion seam-patch CNN follows their idea.
+* G. Paikin and A. Tal, "Solving multiple square jigsaw puzzles with missing pieces",
+  CVPR 2015 (best-buddy confidence ordering).
+* S. Lin and B. Kernighan, "An effective heuristic algorithm for the traveling-salesman
+  problem", 1973 (the Or-opt/2-opt local search is a stripped-down LK).
+* Tesseract OCR; OpenCV (ArUco markers); word list from SCOWL/`wamerican`.
 * Handwriting fonts: Caveat and Indie Flower (SIL Open Font License), from Fontsource.
+
+Built by Odunayo (University of Lagos) as a portfolio / hackathon project.

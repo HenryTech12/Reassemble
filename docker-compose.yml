@@ -1,0 +1,12 @@
+services:
+  api:
+    build: { context: ., dockerfile: Dockerfile.api }
+    ports: ["8000:8000"]
+  web:
+    build:
+      context: ./web
+      args:
+        # the browser talks to the API directly, so this is the address *your browser* uses
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports: ["3000:3000"]
+    depends_on: [api]

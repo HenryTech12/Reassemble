@@ -1,0 +1,16 @@
+# Reassemble API: FastAPI + core engine (CPU only)
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+COPY pyproject.toml README.md ./
+COPY reassemble ./reassemble
+COPY api ./api
+COPY models ./models
+COPY assets ./assets
+RUN pip install --no-cache-dir -e . && python -m reassemble.cli synth --out samples
+EXPOSE 8000
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
