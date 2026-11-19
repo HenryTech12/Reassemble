@@ -17,7 +17,8 @@ make setup          # venv + Python deps (needs `uv`; also: sudo apt-get install
 make test           # run the test suite
 make demo-synth     # generate every synthetic test case into samples/
 reassemble solve samples/memo_30_noisy --out result/   # or: python -m reassemble.cli solve ...
-reassemble bench    # accuracy benchmark on fresh synthetic pages (--suite strips|mixed|double|ocr)
+reassemble bench    # accuracy benchmark (--suite strips|mixed|double|ocr|crosscut|torn|scorers)
+reassemble train    # retrain the CNN edge matcher (~2.5 min on CPU)
 reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR rerank
 ```
 
@@ -31,7 +32,9 @@ reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR re
 | 0 | Synthetic data generator + digital shredders | ✅ |
 | 1 | Strip reconstruction MVP | ✅ |
 | 2 | OCR verification & rerank, two-sided matching, mixed-document separation, gap placeholders | ✅ |
-| 3–8 | learned matcher, cross-cut, torn, capture, web app, ... | in progress |
+| 3 | Learned CNN edge matcher (+ fine-tuning from human corrections) | ✅ |
+| 4 | Cross-cut 2D solver, torn-paper shape matching, handwriting/photos | ✅ (cross-cut: partial) |
+| 5–8 | capture, web app, product angles, polish | in progress |
 
 ## How it works (strip shreds)
 
@@ -169,6 +172,94 @@ the paper's tint. Each document is then solved on its own. Noisy bins, 8 seeds e
 
 **Missing pieces** show up in renders as red hatched placeholders of median strip width.
 
+## Phase 3: learned edge matcher
+
+`reassemble/match/learned.py` defines a small CNN (4 conv layers, about 70k parameters).
+It looks at a **seam patch**: 32 rows × (last 8 px of A + first 8 px of B) × RGB, read
+relative to the paper boundary. It outputs P(true neighbours). This is the early-fusion
+design from Paixão et al.: the convolutions see both sides at once, so they learn stroke
+continuity directly. A pair's cost is the mean −log P over its *informative* patches (those
+with some ink); blank patches are skipped.
+
+* **Data comes free from the generator.** 80 random pages, each shredded into 20–45 strips
+  with random realism (60 % noisy, 30 % extra blur). Positives are true neighbours.
+  Negatives are *hard*: other strips of the same page, including near-misses 2–3 strips
+  away. Training augments with ±1 px vertical shifts and brightness jitter.
+* **Held-out fonts.** Training uses Liberation Serif/Sans/Mono, DejaVu Sans, FreeSerif and
+  Caveat. Validation uses Caladea, Carlito, DejaVu Serif and Indie Flower.
+* **CPU-trainable.** `reassemble train` takes about **2.5 minutes** on 4 CPU cores
+  (77k training patches, 6 epochs, about 81 % single-patch validation accuracy). Weights are
+  in `models/edge_cnn.pt` (280 KB).
+* `--scorer auto` (the default) uses the CNN when PyTorch and the weights are available,
+  and the handcrafted scorer otherwise.
+* **Human-in-the-loop hook:** `reassemble finetune corrections.json` fine-tunes on pairs
+  exported from the editor: label 1 for locked joins, 0 for split ones. Human pairs are
+  upweighted ×4 and mixed with replayed synthetic data so the model doesn't forget.
+
+**Scorer comparison** (content-neighbour accuracy, 4 pages per condition, seeds 700–703):
+
+| condition | handcrafted | learned | combined |
+|---|---|---|---|
+| clean | 1.000 | 1.000 | 0.992 |
+| realistic noise | 0.858 | **1.000** | 1.000 |
+| heavy noise + blur (σ=10, blur 1.2) | 0.404 | **1.000** | 0.953 |
+| handwriting (noisy) | 1.000 | 1.000 | 1.000 |
+| 60 strips (noisy) | 0.684 | **1.000** | 0.990 |
+| **held-out fonts** (noisy) | 0.910 | **1.000** | 1.000 |
+
+With the learned scorer, the standard benchmark (`reassemble bench --scorer learned`,
+4 pages × 5 types) reaches **1.000 content-neighbour accuracy** on clean, noisy and
+noisy-with-2-missing-strips pages. Gap detection improves from 0.14 recall / 0.20 precision
+to **0.40 / 0.70**. The cost is speed: about 3 s per 30-strip page on CPU instead of
+about 0.7 s. "Combined" (average of the two normalised costs) never beat the CNN alone.
+
+## Phase 4: harder shred types
+
+**Cross-cut (2D)**, `reassemble/solve/grid.py`. Top/bottom costs come from the *same*
+matcher applied to **transposed** pieces. Two placers run, and the cheaper result wins:
+* a Pomeranz/Paikin-style greedy placer on a floating grid, which fills the most confident
+  slot first and prefers slots with more placed neighbours;
+* *rows-then-stack*: an ATSP with `rows` copies of the border node splits all pieces into
+  rows, then whole rows are stacked using the **summed** top/bottom cost down every column.
+
+A swap/cyclic-shift local search refines both. Costs are ratio-normalised, which matters
+in 2D: with raw costs, wrong layouts that push every inky edge onto the outer border scored
+better than the truth. Clean letters and memos, 3 seeds each:
+
+| grid | piece size | neighbour | neighbour (content) | direct | time |
+|---|---|---|---|---|---|
+| 3×2 | 425×366 px | 0.952 | 0.952 | 0.833 | 0.25 s |
+| 4×3 | 283×275 px | 0.804 | 0.810 | 0.167 | 0.28 s |
+| 6×5 | 170×183 px | 0.595 | 0.635 | 0.356 | 0.36 s |
+| 8×6 | 141×137 px | 0.402 | 0.429 | 0.056 | 0.52 s |
+| 10×8 | 106×110 px | 0.270 | 0.318 | 0.015 | 0.91 s |
+
+Honest assessment: this is the weakest part of the project. Left/right matching is decent
+(top-1 about 0.75), but **top/bottom matching is poor** (top-1 about 0.2). About half of
+all horizontal cuts fall in the blank space between text lines, so there's nothing to
+match. A text-line-*phase* cue is implemented (`line_phase_cost`) but gave no consistent
+gain, so it is off by default. The CNN wasn't better on cross-cut either; it was trained
+only on vertical seams.
+
+**Torn paper**, `reassemble/solve/torn.py`. A tear is a shared curve. If B sits at offset
+(dx, dy) to the right of A, then `x_A(y) + 1 − x_B(y − dy)` must be constant across the
+overlapping rows. We search every dy, take dx as the median, and use the trimmed mean
+absolute deviation as the **shape cost**. Colours read 4 px inside each boundary (past the
+white fibre rim) add a content-continuity term. Rows lying on the page's own straight edge
+are excluded. Pieces are assembled Kruskal-style by ratio-normalised match quality, and any
+merge that would make pieces overlap is rejected.
+
+| torn pages (memo, letter, photo, handwriting × 3 seeds) | 2×4 pieces | 3×4 pieces |
+|---|---|---|
+| clean, 14 px tears | **1.000** | **1.000** |
+| clean, subtle 6 px tears | 1.000 | 1.000 |
+| noisy (no rotation) | 1.000 | 1.000 |
+| noisy + ±0.4° rotation | 0.558 | 0.613 |
+
+**Handwriting and photos.** The baseline cue is weighted by each strip's text-line
+regularity, so it fades out for handwriting and photos, and the pixel/CNN seam cost carries
+those cases (handwriting: 1.000 with either scorer; photos: 1.000 content accuracy).
+
 ## Known limitations (honest list)
 
 * **Blank strips** can't be ordered. They are placed at the margins, but which blank strip
@@ -181,6 +272,10 @@ the paper's tint. Each document is then solved on its own. Noisy bins, 8 seeds e
   missing strip almost seamlessly.
 * Noisy **invoices** are the hardest printed case (0.84). Their table rules repeat the same
   pattern on many strips.
+* **Torn pieces must be upright.** The shape matcher has no rotation search, so ±0.4° of
+  rotation drops accuracy to about 0.6. (Strips are deskewed by PCA; torn pieces have no
+  long axis to deskew by.)
+* **Cross-cut beyond about 6×5 pieces** is mostly wrong (see the table above).
 * Mixed bins: two pages built from the *same template* (two memos) have nearly identical
   line layouts and can merge into one cluster. The number of documents is right about 75 %
   of the time; when it's wrong, it's usually over-segmentation.
@@ -191,8 +286,8 @@ the paper's tint. Each document is then solved on its own. Noisy bins, 8 seeds e
 reassemble/
   synth/      page renderer (memo, letter, invoice, photo, handwriting) + shredders
   features/   deskew/normalise, edge reading, text-line features
-  match/      pairwise edge costs
-  solve/      greedy, beam search, ATSP local search, gap detection
+  match/      pairwise edge costs (handcrafted + learned CNN)
+  solve/      strips: greedy, beam, ATSP; grid.py: cross-cut; torn.py: torn paper
   verify/     Tesseract OCR readability, reranking, word lists (en, pcm, yo)
   cluster/    mixed-bin document separation
   render/     assembled image + confidence heatmap

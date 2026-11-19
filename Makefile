@@ -6,6 +6,7 @@ SAMPLES ?= samples
 setup:
 	uv venv --python 3.12 .venv
 	uv pip install --python .venv -r requirements.txt
+	uv pip install --python .venv torch --index-url https://download.pytorch.org/whl/cpu || uv pip install --python .venv torch
 	uv pip install --python .venv -e .
 	@echo "Also install Tesseract: sudo apt-get install tesseract-ocr"
 
@@ -23,3 +24,6 @@ bench:
 
 demo-solve: demo-synth
 	$(PY) -m reassemble.cli solve $(SAMPLES)/memo_30_noisy --out result/memo_30_noisy
+
+train:
+	$(PY) -m reassemble.cli train

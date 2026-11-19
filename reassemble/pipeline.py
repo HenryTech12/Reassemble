@@ -23,7 +23,7 @@ class SolveOptions:
     methods: tuple[str, ...] = ("greedy", "beam", "atsp")
     beam_width: int = 200
     top_k: int = 10
-    scorer: str = "handcrafted"           # handcrafted | learned | combined
+    scorer: str = "auto"                  # auto | handcrafted | learned | combined
     use_back: bool = True
     detect_gaps: bool = True
     boundary_weight: float = 2.0
@@ -67,14 +67,37 @@ def prepare(pieces: list[Piece]) -> Prepared:
     return Prepared(norm, feats, back_feats, [p.id for p in norm])
 
 
+def resolve_scorer(name: str) -> str:
+    """'auto' means the learned CNN when PyTorch and trained weights are available.
+
+    The environment variable ``REASSEMBLE_SCORER`` overrides 'auto' (the test suite uses it
+    to stay fast)."""
+    import os
+    if name != "auto":
+        return name
+    if os.environ.get("REASSEMBLE_SCORER"):
+        return os.environ["REASSEMBLE_SCORER"]
+    try:
+        import torch  # noqa: F401
+
+        from .match.learned import DEFAULT_WEIGHTS
+        return "learned" if DEFAULT_WEIGHTS.exists() else "handcrafted"
+    except Exception:
+        return "handcrafted"
+
+
 def cost_matrices(prep: Prepared, opts: SolveOptions) -> dict[str, np.ndarray]:
     back = prep.back_feats if opts.use_back else None
     comps = handcrafted_cost(prep.feats, opts.scorer_cfg, back)
     D = comps["total"]
-    if opts.scorer in ("learned", "combined"):
+    scorer = resolve_scorer(opts.scorer)
+    comps["scorer"] = scorer
+    if scorer in ("learned", "combined"):
         from .match.learned import learned_cost  # lazy: torch is optional
         L = learned_cost(prep.pieces)
-        D = L if opts.scorer == "learned" else 0.5 * (D / np.median(D[D < 1e5]) + L / np.median(L[L < 1e5]))
+        if back is not None:  # back side: same transposition trick as the handcrafted cost
+            L = 0.5 * (L + learned_cost([Piece(id=p.id, image=p.back) for p in prep.pieces]).T)
+        D = L if scorer == "learned" else 0.5 * (D / np.median(D[D < 1e5]) + L / np.median(L[L < 1e5]))
         np.fill_diagonal(D, 1e6)
     comps["raw"] = D
     comps["norm"] = normalize_costs(D)
@@ -140,6 +163,7 @@ def solve_prepared(prep: Prepared, opts: SolveOptions | None = None,
     lin_b, rin_b = bscale * lin, bscale * rin
     rec = build_reconstruction(prep, chosen_order, D, opts, locked, start=lin_b, end=rin_b)
     rec.method = best.method + ("+ocr" if opts.ocr_rerank else "")
+    rec.extra["scorer"] = comps["scorer"]
     if opts.ocr_rerank and "ocr_rerank" in extra:
         flag_ocr_suspects(prep, rec, extra["ocr_rerank"].pop("words"), opts.langs)
     rec.runtime_s = time.perf_counter() - t0
@@ -271,3 +295,57 @@ def solve_mixed(prep: Prepared, opts: SolveOptions | None = None, k: int | None 
     main.extra["clustering"] = {k_: v for k_, v in info.items() if k_ != "silhouette"}
     main.extra["labels"] = {prep.ids[i]: int(lab[i]) for i in range(len(lab))}
     return main
+
+
+def detect_shape(pieces: list[Piece]) -> str:
+    """Guess the shred type from piece geometry.
+
+    Tall thin pieces are strips; pieces whose paper fills much less than their bounding
+    box have irregular (torn) outlines; anything else is a cross-cut rectangle.
+    """
+    aspect = np.median([p.height / max(p.width, 1) for p in pieces])
+    fill = np.median([p.mask.mean() for p in pieces])
+    if aspect > 3:
+        return "strip"
+    if fill < 0.975:
+        return "torn"
+    return "grid"
+
+
+def solve_grid_pieces(pieces: list[Piece], rows: int | None = None, cols: int | None = None,
+                      scorer: str = "handcrafted") -> Reconstruction:
+    from .solve.grid import solve_grid
+
+    res, LR, TB = solve_grid(pieces, rows, cols, scorer=scorer)
+    ids = [p.id for p in pieces]
+    grid = [[ids[x] if x is not None else None for x in row] for row in res.grid]
+    joins = []
+    for r, row in enumerate(res.grid):
+        for c, a in enumerate(row):
+            if a is None:
+                continue
+            if c + 1 < len(row) and row[c + 1] is not None:
+                b = row[c + 1]
+                joins.append({"left": ids[a], "right": ids[b], "side": "lr", "cost": float(LR[a, b]),
+                              "confidence": float(np.clip(1.5 - LR[a, b], 0, 1))})
+            if r + 1 < len(res.grid) and res.grid[r + 1][c] is not None:
+                b = res.grid[r + 1][c]
+                joins.append({"left": ids[a], "right": ids[b], "side": "tb", "cost": float(TB[a, b]),
+                              "confidence": float(np.clip(1.5 - TB[a, b], 0, 1))})
+    order = [x for row in grid for x in row]
+    return Reconstruction(order=order, grid=grid, joins=joins, score=res.cost, method="grid",
+                          runtime_s=res.runtime_s)
+
+
+def solve_torn_pieces(pieces: list[Piece]) -> Reconstruction:
+    from .solve.torn import assemble
+
+    res = assemble(pieces)
+    ids = [p.id for p in pieces]
+    joins = [{"left": ids[m.a], "right": ids[m.b], "side": m.direction, "cost": float(m.cost),
+              "confidence": float(np.clip(1.0 - m.cost / 3.0, 0, 1)), "dx": m.dx, "dy": m.dy}
+             for m in res.accepted]
+    positions = {ids[i]: [int(x), int(y)] for i, (x, y) in res.positions.items()}
+    return Reconstruction(order=[ids[i] for i in sorted(res.positions)], joins=joins, method="torn",
+                          runtime_s=res.runtime_s, extra={"positions": positions,
+                                                          "groups": [[ids[i] for i in g] for g in res.groups]})

@@ -28,7 +28,7 @@ def strip_benchmark(kinds=("memo", "letter", "invoice", "photo", "handwriting"),
             rec = solve_prepared(prep, opts)
             m = evaluate_strips(rec.order, truth, prep.blank)
             m["runtime_s"] = time.perf_counter() - t0
-            for meth, info in rec.extra["methods"].items():
+            for meth, info in rec.extra.get("methods", {}).items():
                 m[f"nb_{meth}"] = evaluate_strips(info["order"], truth)["neighbour"]
             if "gaps" in m:
                 g = m.pop("gaps")
@@ -101,3 +101,94 @@ def ocr_benchmark(kinds=("memo", "letter", "invoice", "handwriting"), seeds=rang
                 out[label].append(evaluate_strips(rec.order, truth, prep.blank))
     return {k: {m: float(np.mean([r[m] for r in v])) for m in ("neighbour", "neighbour_content", "direct_content")}
             for k, v in out.items()}
+
+
+def scorer_benchmark(scorers=("handcrafted", "learned", "combined"), seeds=range(700, 704)) -> dict:
+    """Compare edge scorers on several conditions (content-neighbour accuracy).
+
+    Conditions: clean / realistic printed pages, heavy degradation, handwriting only,
+    60 strips, and pages whose fonts were *held out* from the CNN's training set.
+    """
+    from dataclasses import replace
+
+    from .match.learned import VAL_FONTS
+    heavy = replace(Realism.noisy(), blur_sigma=1.2, noise_sigma=10.0)
+    conds = {
+        "clean": (("memo", "letter", "invoice", "photo"), Realism(), 30, None),
+        "realistic": (("memo", "letter", "invoice", "photo"), Realism.noisy(), 30, None),
+        "heavy noise+blur": (("memo", "letter", "invoice"), heavy, 30, None),
+        "handwriting": (("handwriting",), Realism.noisy(), 30, None),
+        "60 strips": (("memo", "letter", "invoice"), Realism.noisy(), 60, None),
+        "held-out fonts": (("memo", "letter", "invoice", "handwriting"), Realism.noisy(), 30, VAL_FONTS),
+    }
+    table = {}
+    for cname, (kinds, real, n, fonts) in conds.items():
+        cases = []
+        for kind in kinds:
+            s, found = 0, 0
+            while found < len(seeds):
+                seed = seeds[0] + s
+                s += 1
+                page, meta = render_page(kind, seed)
+                if fonts is not None and meta["font"] not in fonts:
+                    continue
+                found += 1
+                cases.append((page, seed))
+        rows = {sc: [] for sc in scorers}
+        for page, seed in cases:
+            pieces, truth = strip_shred(page, n, real, seed=seed)
+            prep = prepare(pieces)
+            for sc in scorers:
+                rec = solve_prepared(prep, SolveOptions(scorer=sc, detect_gaps=False))
+                rows[sc].append(evaluate_strips(rec.order, truth, prep.blank)["neighbour_content"])
+        table[cname] = {sc: float(np.mean(v)) for sc, v in rows.items()}
+        print(cname, {k: round(v, 3) for k, v in table[cname].items()}, flush=True)
+    return table
+
+
+def crosscut_benchmark(sizes=((3, 2), (4, 3), (6, 5), (8, 6), (10, 8)), seeds=range(40, 43),
+                       kinds=("letter", "memo")) -> dict:
+    """Cross-cut accuracy by grid size (clean scans)."""
+    from .features.edges import extract
+    from .solve.grid import evaluate_grid, solve_grid
+    from .synth.shredders import crosscut_shred
+    out = {}
+    for rows, cols in sizes:
+        ms = []
+        for kind in kinds:
+            for seed in seeds:
+                page, _ = render_page(kind, seed)
+                pieces, truth = crosscut_shred(page, rows, cols, seed=seed)
+                blank = {p.id for p in pieces if extract(p).ink_fraction < 0.002}
+                res, _, _ = solve_grid(pieces, rows, cols)
+                ids = [p.id for p in pieces]
+                pred = [[ids[x] if x is not None else None for x in r] for r in res.grid]
+                m = evaluate_grid(pred, truth["grid"], blank)
+                m["runtime_s"] = res.runtime_s
+                ms.append(m)
+        piece = f"{850 // cols}x{1100 // rows}px"
+        out[f"{rows}x{cols} ({piece})"] = {k: float(np.mean([m[k] for m in ms])) for k in ms[0]}
+    return out
+
+
+def torn_benchmark(seeds=range(20, 23), kinds=("memo", "letter", "photo", "handwriting")) -> dict:
+    from dataclasses import replace
+    from .solve.torn import assemble, evaluate_torn
+    from .synth.shredders import torn_shred
+    conds = {"clean, 14px tears": (Realism(), 14), "clean, 6px tears": (Realism(), 6),
+             "noisy (no rotation)": (replace(Realism.noisy(), rotation_deg=0), 10),
+             "noisy + 0.4 deg rotation": (Realism.noisy(), 10)}
+    out = {}
+    for name, (r, amp) in conds.items():
+        for shape in ((2, 4), (3, 4)):
+            ms = []
+            for kind in kinds:
+                for seed in seeds:
+                    page, _ = render_page(kind, seed)
+                    pcs, t = torn_shred(page, *shape, amplitude=amp, seed=seed, realism=r)
+                    res = assemble(pcs)
+                    m = evaluate_torn(pcs, res, t)
+                    m["runtime_s"] = res.runtime_s
+                    ms.append(m)
+            out[f"{name} {shape[0]}x{shape[1]}"] = {k: float(np.mean([m[k] for m in ms])) for k in ms[0]}
+    return out

@@ -18,8 +18,9 @@ from PIL import Image
 
 WORDLIST_DIR = Path(__file__).parent / "wordlists"
 # Tesseract's OpenMP threads thrash badly when several OCR jobs run in parallel; we
-# parallelise across images instead, one thread each.
-os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+# parallelise across images instead, one thread each.  The limit is passed only to the
+# tesseract subprocess: setting it process-wide would also starve PyTorch's thread pool.
+_TESS_ENV = dict(os.environ, OMP_THREAD_LIMIT="1")
 _TOKEN = re.compile(r"[A-Za-zÀ-ÿẸẹỌọṢṣ]+")
 
 
@@ -35,12 +36,8 @@ def load_words(langs: str = "en") -> frozenset[str]:
 
 
 def tesseract_available() -> bool:
-    try:
-        import pytesseract
-        pytesseract.get_tesseract_version()
-        return True
-    except Exception:
-        return False
+    import shutil
+    return shutil.which("tesseract") is not None
 
 
 def flatten_for_ocr(img: Image.Image) -> Image.Image:
@@ -52,15 +49,23 @@ def flatten_for_ocr(img: Image.Image) -> Image.Image:
 
 
 def ocr_words(img: Image.Image) -> list[dict]:
-    """Run Tesseract and return word boxes: {text, conf, x, y, w, h}."""
-    import pytesseract
+    """Run Tesseract (TSV output) and return word boxes: {text, conf, x, y, w, h}."""
+    import subprocess
+    import tempfile
 
-    d = pytesseract.image_to_data(flatten_for_ocr(img), output_type=pytesseract.Output.DICT)
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "page.png"
+        flatten_for_ocr(img).save(f)
+        r = subprocess.run(["tesseract", str(f), "stdout", "tsv"], capture_output=True,
+                           text=True, env=_TESS_ENV, timeout=120)
     out = []
-    for i, t in enumerate(d["text"]):
-        if t and t.strip():
-            out.append({"text": t.strip(), "conf": float(d["conf"][i]), "x": d["left"][i],
-                        "y": d["top"][i], "w": d["width"][i], "h": d["height"][i]})
+    lines = r.stdout.splitlines()
+    for line in lines[1:]:
+        cols = line.split("\t")
+        if len(cols) < 12 or not cols[11].strip():
+            continue
+        out.append({"text": cols[11].strip(), "conf": float(cols[10]), "x": int(cols[6]),
+                    "y": int(cols[7]), "w": int(cols[8]), "h": int(cols[9])})
     return out
 
 

@@ -25,7 +25,7 @@ def cmd_solve(args: argparse.Namespace) -> int:
 
     from .metrics import evaluate_strips
     from .model import load_case
-    from .pipeline import SolveOptions, prepare, solve_mixed, solve_prepared
+    from .pipeline import SolveOptions, detect_shape, prepare, solve_mixed, solve_prepared
     from .render.compose import render_strips
 
     pieces, truth = load_case(args.case)
@@ -34,6 +34,12 @@ def cmd_solve(args: argparse.Namespace) -> int:
         return 1
     opts = SolveOptions(methods=tuple(args.methods.split(",")), beam_width=args.beam,
                         scorer=args.scorer, ocr_rerank=args.ocr, langs=args.lang)
+    shape = args.shape
+    if shape == "auto":
+        kind = (truth or {}).get("kind")
+        shape = {"crosscut": "grid", "torn": "torn"}.get(kind) or detect_shape(pieces)
+    if shape in ("grid", "torn"):
+        return _solve_2d(args, pieces, truth, shape)
     prep = prepare(pieces)
     prog = (lambda e: print("  ..", e["stage"])) if args.verbose else None
     mixed = args.mixed or (truth or {}).get("kind") == "mixed"
@@ -70,6 +76,41 @@ def cmd_solve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _solve_2d(args, pieces, truth, shape) -> int:
+    import json
+    from pathlib import Path
+
+    from .pipeline import solve_grid_pieces, solve_torn_pieces
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    if shape == "grid":
+        from .render.compose import render_grid
+        from .solve.grid import evaluate_grid
+        rows = truth.get("rows") if truth else args.rows
+        cols = truth.get("cols") if truth else args.cols
+        rec = solve_grid_pieces(pieces, rows or args.rows, cols or args.cols)
+        render_grid({p.id: p for p in pieces}, rec.grid).save(out / "reconstruction.png")
+        result = rec.to_dict()
+        if truth:
+            result["metrics"] = evaluate_grid(rec.grid, truth["grid"])
+    else:
+        from .solve.torn import TornResult, evaluate_torn, render_torn
+        rec = solve_torn_pieces(pieces)
+        ids = [p.id for p in pieces]
+        tr = TornResult({ids.index(k): tuple(v) for k, v in rec.extra["positions"].items()}, [], [], 0)
+        render_torn(pieces, tr).save(out / "reconstruction.png")
+        result = rec.to_dict()
+        if truth:
+            result["metrics"] = evaluate_torn(pieces, tr, truth)
+    print(f"solved {len(pieces)} {shape} pieces in {rec.runtime_s:.2f}s")
+    if "metrics" in result:
+        print("accuracy: " + ", ".join(f"{k}={v:.3f}" for k, v in result["metrics"].items()))
+    (out / "result.json").write_text(json.dumps(result, indent=1))
+    print(f"wrote {out}/reconstruction.png, result.json")
+    return 0
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     from . import bench as B
     from .bench import print_table, strip_benchmark
@@ -82,6 +123,15 @@ def cmd_bench(args: argparse.Namespace) -> int:
     if args.suite == "double":
         print_table(B.double_sided_benchmark())
         return 0
+    if args.suite == "crosscut":
+        print_table(B.crosscut_benchmark())
+        return 0
+    if args.suite == "torn":
+        print_table(B.torn_benchmark())
+        return 0
+    if args.suite == "scorers":
+        B.scorer_benchmark()
+        return 0
     if args.suite == "ocr":
         print_table(B.ocr_benchmark())
         return 0
@@ -92,6 +142,32 @@ def cmd_bench(args: argparse.Namespace) -> int:
         res = strip_benchmark(n=args.n, noisy=noisy, seeds=seeds, opts=opts, drop=drop)
         print(f"\n### {args.n} strips, {label} ({len(seeds)} pages per type, scorer={args.scorer})")
         print_table(res)
+    return 0
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    from .match.learned import train
+
+    stats = train(args.out, n_pages=args.pages, epochs=args.epochs, seed=args.seed)
+    Path(args.out).with_suffix(".json").write_text(json.dumps(stats, indent=1))
+    print(f"saved {args.out} ({stats['seconds']:.0f}s)")
+    return 0
+
+
+def cmd_finetune(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    from .match.learned import DEFAULT_WEIGHTS, finetune_from_corrections
+
+    corrections = json.loads(Path(args.corrections).read_text())
+    if isinstance(corrections, dict):
+        corrections = corrections.get("pairs", [])
+    stats = finetune_from_corrections(corrections, init=args.init or DEFAULT_WEIGHTS, out=args.out)
+    print(f"fine-tuned on {len(corrections)} human pairs in {stats['seconds']:.0f}s -> {args.out}")
     return 0
 
 
@@ -114,22 +190,38 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", default="result")
     s.add_argument("--methods", default="greedy,beam,atsp")
     s.add_argument("--beam", type=int, default=200, help="beam width")
-    s.add_argument("--scorer", default="handcrafted", choices=["handcrafted", "learned", "combined"])
+    s.add_argument("--scorer", default="auto", choices=["auto", "handcrafted", "learned", "combined"])
     s.add_argument("--ocr", action="store_true", help="rerank top candidates with OCR")
     s.add_argument("--lang", default="en", help="word lists for OCR, e.g. en,pcm,yo")
     s.add_argument("--mixed", action="store_true", help="pile may contain several documents")
     s.add_argument("--docs", type=int, default=None, help="number of documents (default: auto)")
+    s.add_argument("--shape", default="auto", choices=["auto", "strip", "grid", "torn"])
+    s.add_argument("--rows", type=int, default=None, help="cross-cut grid rows (default: guess)")
+    s.add_argument("--cols", type=int, default=None, help="cross-cut grid cols (default: guess)")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_solve)
 
     s = sub.add_parser("bench", help="benchmark strip reconstruction on fresh synthetic pages")
-    s.add_argument("--suite", default="strips", choices=["strips", "mixed", "double", "ocr"])
+    s.add_argument("--suite", default="strips", choices=["strips", "mixed", "double", "ocr", "crosscut", "torn", "scorers"])
     s.add_argument("-n", type=int, default=30)
     s.add_argument("--seeds", type=int, default=5)
     s.add_argument("--seed", type=int, default=100)
-    s.add_argument("--scorer", default="handcrafted", choices=["handcrafted", "learned", "combined"])
+    s.add_argument("--scorer", default="auto", choices=["auto", "handcrafted", "learned", "combined"])
     s.add_argument("--ocr", action="store_true")
     s.set_defaults(func=cmd_bench)
+
+    s = sub.add_parser("train", help="train the learned edge matcher on synthetic data")
+    s.add_argument("--out", default="models/edge_cnn.pt")
+    s.add_argument("--pages", type=int, default=80)
+    s.add_argument("--epochs", type=int, default=6)
+    s.add_argument("--seed", type=int, default=0)
+    s.set_defaults(func=cmd_train)
+
+    s = sub.add_parser("finetune", help="fine-tune the matcher on corrections exported from the editor")
+    s.add_argument("corrections", help="JSON list of {case, left, right, label}")
+    s.add_argument("--init", default=None)
+    s.add_argument("--out", default="models/edge_cnn_finetuned.pt")
+    s.set_defaults(func=cmd_finetune)
     return p
 
 
