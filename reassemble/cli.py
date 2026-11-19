@@ -126,6 +126,9 @@ def cmd_bench(args: argparse.Namespace) -> int:
     if args.suite == "crosscut":
         print_table(B.crosscut_benchmark())
         return 0
+    if args.suite == "capture":
+        print_table(B.capture_benchmark())
+        return 0
     if args.suite == "torn":
         print_table(B.torn_benchmark())
         return 0
@@ -171,6 +174,71 @@ def cmd_finetune(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_synth_photo(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    import cv2
+
+    from .synth.pages import render_page
+    from .synth.photo import compose_photo
+    from .synth.shredders import Realism, strip_shred
+
+    page, meta = render_page(args.kind, args.seed)
+    pieces, truth = strip_shred(page, args.n, Realism(noise_sigma=2), seed=args.seed)
+    photo, pt = compose_photo(pieces, seed=args.seed)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out / "photo.jpg"), photo, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    truth.update(pt)
+    truth["page"] = meta
+    (out / "photo_truth.json").write_text(json.dumps(truth))
+    print(f"wrote {out}/photo.jpg ({photo.shape[1]}x{photo.shape[0]}) and photo_truth.json")
+    return 0
+
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    import cv2
+    import numpy as np
+
+    from .capture.pipeline import capture
+    from .model import save_case
+
+    img = cv2.imread(args.photo, cv2.IMREAD_COLOR)
+    if img is None:
+        print(f"cannot read {args.photo}")
+        return 1
+    pieces, rep = capture(img, mat_scale=args.scale, out_scale=args.out_scale)
+    truth = None
+    tf = Path(args.photo).with_name("photo_truth.json")
+    if tf.exists():  # simulated photo: translate ground truth to the captured piece ids
+        pt = json.loads(tf.read_text())
+        cen = pt["centres_mat"]
+        mapping = {}
+        for p in pieces:
+            c = np.array(p.meta["centre"])
+            mapping[min(cen, key=lambda k: np.linalg.norm(np.array(cen[k]) - c))] = p.id
+        truth = {"kind": "strip", "order": [mapping.get(k, f"missing_{k}") for k in pt["order"]],
+                 "missing": [f"missing_{k}" for k in pt["order"] if k not in mapping]}
+    save_case(args.out, pieces, truth)
+    (Path(args.out) / "capture.json").write_text(json.dumps(
+        {"report": rep.__dict__, "pieces": {p.id: p.meta for p in pieces}}, indent=1))
+    print(f"captured {rep.n_pieces} pieces (markers: {rep.markers_found}, rectified: {rep.rectified}, "
+          f"watershed splits: {rep.split_by_watershed}) -> {args.out}")
+    for n in rep.notes:
+        print("  note:", n)
+    return 0
+
+
+def cmd_mat(args: argparse.Namespace) -> int:
+    from .capture.mat import save_mat_pdf
+    print(f"wrote {save_mat_pdf(args.out)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="reassemble", description="Reassemble shredded documents.")
     sub = p.add_subparsers(dest="command", required=True)
@@ -184,6 +252,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--noisy", action="store_true", help="apply realistic degradation")
     s.add_argument("--drop", type=int, default=0, help="number of strips to remove")
     s.set_defaults(func=cmd_synth)
+
+    s = sub.add_parser("synth-photo", help="simulate a phone photo of strips on the capture mat")
+    s.add_argument("--out", default="samples/photo")
+    s.add_argument("--kind", default="letter", choices=["memo", "letter", "invoice", "photo", "handwriting"])
+    s.add_argument("-n", type=int, default=24)
+    s.add_argument("--seed", type=int, default=33)
+    s.set_defaults(func=cmd_synth_photo)
+
+    s = sub.add_parser("capture", help="photo/scan of pieces on a dark background -> piece PNGs")
+    s.add_argument("photo")
+    s.add_argument("--out", default="pieces")
+    s.add_argument("--scale", type=float, default=2.0, help="mat-frame resolution (2 = ~200 dpi)")
+    s.add_argument("--out-scale", type=float, default=1.0, help="resize output pieces")
+    s.set_defaults(func=cmd_capture)
+
+    s = sub.add_parser("mat", help="write the printable capture-mat PDF")
+    s.add_argument("--out", default="assets/capture_mat.pdf")
+    s.set_defaults(func=cmd_mat)
 
     s = sub.add_parser("solve", help="reconstruct a folder of strip pieces")
     s.add_argument("case", help="case folder (with pieces/ or PNGs directly)")
@@ -202,7 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_solve)
 
     s = sub.add_parser("bench", help="benchmark strip reconstruction on fresh synthetic pages")
-    s.add_argument("--suite", default="strips", choices=["strips", "mixed", "double", "ocr", "crosscut", "torn", "scorers"])
+    s.add_argument("--suite", default="strips", choices=["strips", "mixed", "double", "ocr", "crosscut", "torn", "scorers", "capture"])
     s.add_argument("-n", type=int, default=30)
     s.add_argument("--seeds", type=int, default=5)
     s.add_argument("--seed", type=int, default=100)

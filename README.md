@@ -34,7 +34,8 @@ reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR re
 | 2 | OCR verification & rerank, two-sided matching, mixed-document separation, gap placeholders | ✅ |
 | 3 | Learned CNN edge matcher (+ fine-tuning from human corrections) | ✅ |
 | 4 | Cross-cut 2D solver, torn-paper shape matching, handwriting/photos | ✅ (cross-cut: partial) |
-| 5–8 | capture, web app, product angles, polish | in progress |
+| 5 | Real-world capture (photo → pieces), capture mat, simulated test photo | ✅ |
+| 6–8 | web app, product angles, polish | in progress |
 
 ## How it works (strip shreds)
 
@@ -260,6 +261,51 @@ merge that would make pieces overlap is rejected.
 regularity, so it fades out for handwriting and photos, and the pixel/CNN seam cost carries
 those cases (handwriting: 1.000 with either scorer; photos: 1.000 content accuracy).
 
+## Phase 5: real-world capture
+
+```bash
+reassemble mat                                   # printable capture mat -> assets/capture_mat.pdf
+reassemble synth-photo --out samples/photo       # simulated phone photo you can reproduce
+reassemble capture samples/photo/photo.jpg --out pieces/
+reassemble solve pieces/ --out result/photo      # -> content-neighbour 1.000 on this photo
+```
+
+The pipeline lives in `reassemble/capture/pipeline.py`:
+
+1. **Rectify.** If at least 3 of the 4 ArUco markers on the printed mat are found, their
+   corners give a homography into the mat frame, rendered at 2× (about 200 dpi).
+2. **Flat-field.** The light field is estimated from the paper itself (a normalised
+   convolution over paper pixels on a 1/16-scale image) and divided out. Doing this at full
+   resolution was 80× slower for the same result.
+3. **Segment.** Otsu threshold on lightness, then morphology and hole filling. Touching
+   pieces are split by a distance-transform **watershed**, but only when the cores sit side
+   by side *across* the blob's long axis. Several cores *along* one strip just mean ink
+   dents in the mask.
+4. **Per piece.** Deskew with the PCA long axis, rotating colour and mask *separately*.
+   **Repair the edges.** Dark ink touching a cut edge looks like background to a threshold,
+   so the mask gets dented exactly where the most useful pixels are. Each boundary is
+   snapped to a rolling-median line and only real outward bulges are kept. Then shave
+   **2 px** of mixed paper/background colour (1 px leaves a dark fringe that reads as ink;
+   3 px throws away too much). Finally crop to RGBA and normalise heights.
+
+The output is the same `Piece` format as the generator, so everything downstream works
+unchanged.
+
+The **simulated photo** (`reassemble/synth/photo.py`) scatters the strips on a dark
+fabric-textured mat with ±1.2° rotation and uneven spacing. It adds a lighting gradient,
+vignetting, a random perspective, sensor noise and JPEG compression.
+
+| 10 simulated photos (5 page types × 2 seeds, 24 strips) | result |
+|---|---|
+| pieces found and segmented correctly | **100 %** |
+| content-neighbour, handcrafted scorer | 0.781 |
+| content-neighbour, learned scorer | **0.828** |
+
+What I learned debugging this: **resolution matters more than anything**. At the
+generator's 100 dpi, letter strokes are about 2 px wide, and any real capture loses about
+1 px at each cut, so accuracy collapsed to about 0.1. Capturing at 2× (still below a
+typical phone photo or a 300-dpi flatbed scan) brought it to about 0.8.
+
 ## Known limitations (honest list)
 
 * **Blank strips** can't be ordered. They are placed at the margins, but which blank strip
@@ -276,6 +322,9 @@ those cases (handwriting: 1.000 with either scorer; photos: 1.000 content accura
   rotation drops accuracy to about 0.6. (Strips are deskewed by PCA; torn pieces have no
   long axis to deskew by.)
 * **Cross-cut beyond about 6×5 pieces** is mostly wrong (see the table above).
+* **Capture** assumes strips are laid roughly upright (within ±45°). A strip that is upside
+  down can't be told apart, and capture is not yet tuned on real photos; the mat, threshold
+  and erosion values were chosen on simulated ones.
 * Mixed bins: two pages built from the *same template* (two memos) have nearly identical
   line layouts and can merge into one cluster. The number of documents is right about 75 %
   of the time; when it's wrong, it's usually over-segmentation.
@@ -290,6 +339,7 @@ reassemble/
   solve/      strips: greedy, beam, ATSP; grid.py: cross-cut; torn.py: torn paper
   verify/     Tesseract OCR readability, reranking, word lists (en, pcm, yo)
   cluster/    mixed-bin document separation
+  capture/    photo -> pieces (ArUco rectification, flat-field, watershed, edge repair), mat PDF
   render/     assembled image + confidence heatmap
   metrics.py  neighbour / direct accuracy, gap precision/recall
   pipeline.py prepare -> score -> solve -> Reconstruction

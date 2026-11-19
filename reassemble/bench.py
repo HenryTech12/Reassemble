@@ -192,3 +192,26 @@ def torn_benchmark(seeds=range(20, 23), kinds=("memo", "letter", "photo", "handw
                     ms.append(m)
             out[f"{name} {shape[0]}x{shape[1]}"] = {k: float(np.mean([m[k] for m in ms])) for k in ms[0]}
     return out
+
+
+def capture_benchmark(kinds=("memo", "letter", "invoice", "handwriting", "photo"), seeds=(33, 34), n: int = 24) -> dict:
+    """Simulated phone photo -> capture -> solve, content-neighbour accuracy per scorer."""
+    from .capture.pipeline import capture
+    from .synth.photo import compose_photo
+    out = {"handcrafted": [], "learned": [], "pieces_found": []}
+    for kind in kinds:
+        for seed in seeds:
+            page, _ = render_page(kind, seed)
+            pieces, truth = strip_shred(page, n, Realism(noise_sigma=2), seed=seed)
+            photo, pt = compose_photo(pieces, seed=seed)
+            cap, rep = capture(photo)
+            cen = pt["centres_mat"]
+            mp = {p.id: min(cen, key=lambda k: np.linalg.norm(np.array(cen[k]) - np.array(p.meta["centre"])))
+                  for p in cap}
+            out["pieces_found"].append(len(set(mp.values())) / n)
+            prep = prepare(cap)
+            for sc in ("handcrafted", "learned"):
+                rec = solve_prepared(prep, SolveOptions(scorer=sc))
+                order = [mp[x] if x else None for x in rec.order]
+                out[sc].append(evaluate_strips(order, truth, {mp[b] for b in prep.blank})["neighbour_content"])
+    return {"simulated photo": {k: float(np.mean(v)) for k, v in out.items()}}

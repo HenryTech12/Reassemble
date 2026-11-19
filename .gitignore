@@ -9,3 +9,4 @@ runs/
 node_modules/
 web/.next/
 *.egg-info/
+pieces/
