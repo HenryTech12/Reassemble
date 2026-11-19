@@ -37,8 +37,13 @@ def candidate_orders(M: np.ndarray, best_tour: list[int], n: int, beam_alts=(), 
 
 
 def rerank_candidates(prep, cands: list[tuple[float, list[int]]], langs: str = "en",
-                      alpha: float = 0.03, scale: float | None = None) -> tuple[list[int], dict]:
-    """Pick the candidate maximising ``readability - alpha * extra_cost / scale``.
+                      alpha: float = 0.03, scale: float | None = None,
+                      lm_weight: float = 0.0) -> tuple[list[int], dict]:
+    """Pick the candidate maximising
+    ``readability + lm_weight * LM log-prob/char - alpha * extra_cost / scale``.
+
+    The language-model term (``verify/lm.py``, English only) rewards text that reads
+    like English across seams, not just tokens that happen to be dictionary words.
 
     ``extra_cost`` is how much worse than the best the candidate's seam cost is, in units
     of a typical join cost: OCR can overrule the pixel solver, but only when the text is
@@ -50,17 +55,28 @@ def rerank_candidates(prep, cands: list[tuple[float, list[int]]], langs: str = "
         rec = Reconstruction(order=[prep.ids[i] for i in order])
         img = render_strips(by_id, rec, background=(255, 255, 255, 255))
         words = ocr_words(img)
-        return readability(words, langs), words
+        r = readability(words, langs)
+        r["lm"] = _lm_score(words) if lm_weight else 0.0
+        return r, words
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         scored = list(ex.map(score, [o for _, o in cands]))
     reads = [r for r, _ in scored]
     costs = np.array([c for c, _ in cands])
     sc = scale or max(1e-9, float(np.median(np.diff(sorted(costs)))) if len(costs) > 2 else 1.0)
-    total = np.array([r["score"] for r in reads]) - alpha * (costs - costs.min()) / sc
+    total = (np.array([r["score"] for r in reads]) + lm_weight * np.array([r["lm"] for r in reads])
+             - alpha * (costs - costs.min()) / sc)
     k = int(np.argmax(total))
     info = {"chosen": k, "candidates": [
         {"cost": float(c), "readability": r, "total": float(t), "order": [prep.ids[i] for i in o]}
         for c, r, t, (_, o) in zip(costs, reads, total, cands)]}
     info["words"] = scored[k][1]
     return list(cands[k][1]), info
+
+
+def _lm_score(words: list[dict]) -> float:
+    from .lm import default_lm
+    lm = default_lm()
+    if lm is None:
+        return 0.0
+    return lm.logprob_per_char(" ".join(w["text"] for w in words))

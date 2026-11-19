@@ -12,7 +12,7 @@ from .features.edges import EdgeFeatures, extract, extract_back, sharpen_amount,
 from .features.normalize import normalize_heights, normalize_piece
 from .match.handcrafted import ScorerConfig, edge_inkiness, handcrafted_cost, normalize_costs
 from .model import Piece, Reconstruction
-from .solve.joins import detect_gaps
+from .solve.joins import detect_gaps, join_features, load_gap_model
 from .solve.strips import build_atsp, join_min_marginals, solve_strips
 
 Progress = Callable[[dict], None]
@@ -34,6 +34,7 @@ class SolveOptions:
     park_blanks: bool = True
     ocr_candidates: int = 8
     ocr_alpha: float = 0.05
+    lm_weight: float = 0.3                # weight of the local English char-LM in OCR rerank
     langs: str = "en"
     scorer_cfg: ScorerConfig = field(default_factory=ScorerConfig)
 
@@ -157,11 +158,13 @@ def solve_prepared(prep: Prepared, opts: SolveOptions | None = None,
         cands = [(c, full(o)) for c, o in cands]
         emit({"stage": "ocr_rerank", "candidates": len(cands)})
         chosen_order, rr = rerank_candidates(prep, cands, opts.langs, opts.ocr_alpha,
-                                             scale=float(np.median(S[S < 1e5])))
+                                             scale=float(np.median(S[S < 1e5])),
+                                             lm_weight=opts.lm_weight if opts.langs == "en" else 0.0)
         extra["ocr_rerank"] = rr
     emit({"stage": "solved", "order": [prep.ids[i] for i in chosen_order]})
     lin_b, rin_b = bscale * lin, bscale * rin
-    rec = build_reconstruction(prep, chosen_order, D, opts, locked, start=lin_b, end=rin_b)
+    rec = build_reconstruction(prep, chosen_order, D, opts, locked, start=lin_b, end=rin_b,
+                               scorer=comps["scorer"])
     rec.method = best.method + ("+ocr" if opts.ocr_rerank else "")
     rec.extra["scorer"] = comps["scorer"]
     if opts.ocr_rerank and "ocr_rerank" in extra:
@@ -207,7 +210,7 @@ def park_blanks(order: list[int], blanks: list[int], feats: list[EdgeFeatures]) 
 
 
 def build_reconstruction(prep: Prepared, order: list[int], D: np.ndarray, opts: SolveOptions,
-                         locked_idx=(), start=None, end=None) -> Reconstruction:
+                         locked_idx=(), start=None, end=None, scorer: str | None = None) -> Reconstruction:
     """Attach per-join confidences and gap markers to a solved order.
 
     Confidence is ``1 - exp(-delta / scale)`` where ``delta`` is the join's min-marginal
@@ -229,9 +232,17 @@ def build_reconstruction(prep: Prepared, order: list[int], D: np.ndarray, opts: 
     informative = np.array([prep.ids[a] not in blank and prep.ids[b] not in blank
                             for a, b in zip(order, order[1:])], bool)
     med = float(np.median(content_costs)) if content_costs else 1.0
-    gaps = (detect_gaps(costs / max(med, 1e-9), [N[a, b] for a, b in zip(order, order[1:])],
-                        informative) if opts.detect_gaps and len(costs) >= 4
-            else np.zeros(len(costs), bool))
+    ink_l, ink_r = edge_inkiness(prep.feats)
+    feats = join_features(order, D, N, confs, ink_r, ink_l, med) if len(costs) else np.zeros((0, 8))
+    model = load_gap_model(scorer) if scorer else None
+    if not (opts.detect_gaps and len(costs) >= 4):
+        gaps = np.zeros(len(costs), bool)
+    elif model is not None:
+        # learned "is this join a missing strip?" classifier (solve/joins.py)
+        gaps = (model["clf"].predict_proba(feats)[:, 1] > model["threshold"]) & informative
+    else:
+        gaps = detect_gaps(costs / max(med, 1e-9), [N[a, b] for a, b in zip(order, order[1:])],
+                           informative)
     out_order: list[str | None] = [prep.ids[order[0]]] if order else []
     joins, gap_list = [], []
     med_w = float(np.median([f.width for f in prep.feats])) if prep.feats else 0
@@ -248,7 +259,7 @@ def build_reconstruction(prep: Prepared, order: list[int], D: np.ndarray, opts: 
         out_order.append(prep.ids[b])
     score = float(np.mean(costs)) if len(costs) else 0.0
     return Reconstruction(order=out_order, joins=joins, gaps=gap_list, score=score,
-                          extra={"blank": sorted(blank)})
+                          extra={"blank": sorted(blank), "join_features": feats.tolist()})
 
 
 def solve_pieces(pieces: list[Piece], opts: SolveOptions | None = None,
@@ -337,15 +348,26 @@ def solve_grid_pieces(pieces: list[Piece], rows: int | None = None, cols: int | 
                           runtime_s=res.runtime_s)
 
 
-def solve_torn_pieces(pieces: list[Piece]) -> Reconstruction:
-    from .solve.torn import assemble
+def solve_torn_pieces(pieces: list[Piece], deskew_threshold: float = 0.4) -> Reconstruction:
+    """Torn-paper assembly.  If the pieces' text lines show they were photographed
+    rotated (median |angle| above ``deskew_threshold`` degrees), each piece is deskewed
+    from its own text lines first; below that the residual estimation error (~0.15°)
+    would be as large as the rotation itself, so the pieces are used as they are."""
+    from .solve.torn import assemble, assemble_rotated, text_angle
 
-    res = assemble(pieces)
+    est = [text_angle(p) for p in pieces]
+    strong = [abs(a) for a, s in est if s > 1.1]
+    rotations: dict[str, float] = {}
+    if strong and float(np.median(strong)) > deskew_threshold:
+        res, pieces, angles = assemble_rotated(pieces)
+        rotations = {p.id: float(a) for p, a in zip(pieces, angles)}
+    else:
+        res = assemble(pieces)
     ids = [p.id for p in pieces]
     joins = [{"left": ids[m.a], "right": ids[m.b], "side": m.direction, "cost": float(m.cost),
               "confidence": float(np.clip(1.0 - m.cost / 3.0, 0, 1)), "dx": m.dx, "dy": m.dy}
              for m in res.accepted]
     positions = {ids[i]: [int(x), int(y)] for i, (x, y) in res.positions.items()}
     return Reconstruction(order=[ids[i] for i in sorted(res.positions)], joins=joins, method="torn",
-                          runtime_s=res.runtime_s, extra={"positions": positions,
+                          runtime_s=res.runtime_s, extra={"positions": positions, "rotations": rotations,
                                                           "groups": [[ids[i] for i in g] for g in res.groups]})

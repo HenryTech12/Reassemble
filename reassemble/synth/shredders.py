@@ -235,7 +235,7 @@ def torn_shred(page: np.ndarray, rows: int = 2, cols: int = 4, amplitude: float 
         row_idx += (yy >= t[None, :]).astype(np.int32)
     label = row_idx * cols + col_idx
     ids = _ids(rows * cols, rng)
-    pieces, grid, offsets = [], [[None] * cols for _ in range(rows)], {}
+    pieces, grid, offsets, centres = [], [[None] * cols for _ in range(rows)], {}, {}
     for i in range(rows):
         for j in range(cols):
             k = i * cols + j
@@ -255,8 +255,9 @@ def torn_shred(page: np.ndarray, rows: int = 2, cols: int = 4, amplitude: float 
             pieces.append(Piece(id=ids[k], image=degrade(crop, r, nrng)))
             grid[i][j] = ids[k]
             offsets[ids[k]] = [int(x0), int(y0)]
+            centres[ids[k]] = [float(xs_.mean()), float(ys_.mean())]
     rng.shuffle(pieces)
-    truth = {"kind": "torn", "rows": rows, "cols": cols, "grid": grid, "offsets": offsets,
+    truth = {"kind": "torn", "rows": rows, "cols": cols, "grid": grid, "offsets": offsets, "centres": centres,
              "missing": [], "page_size": [h, w], "realism": r.to_dict()}
     return pieces, truth
 

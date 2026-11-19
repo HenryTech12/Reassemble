@@ -104,7 +104,7 @@ def audit(pieces: list[Piece], dpi: float = 100.0, original: np.ndarray | None =
         from ..solve.torn import TornResult, render_torn
         rec = solve_torn_pieces(pieces)
         ids = [p.id for p in pieces]
-        img = render_torn(pieces, TornResult({ids.index(k): tuple(v) for k, v in rec.extra["positions"].items()}, [], [], 0),
+        img = render_torn(pieces, TornResult({ids.index(k): tuple(v) for k, v in rec.extra["positions"].items()}, [], [], 0), rotations=rec.extra.get("rotations"),
                           background=(255, 255, 255, 255))
     seconds = time.perf_counter() - t0
     mm = 25.4 / dpi

@@ -173,11 +173,14 @@ def crosscut_benchmark(sizes=((3, 2), (4, 3), (6, 5), (8, 6), (10, 8)), seeds=ra
 
 def torn_benchmark(seeds=range(20, 23), kinds=("memo", "letter", "photo", "handwriting")) -> dict:
     from dataclasses import replace
-    from .solve.torn import assemble, evaluate_torn
+    from .pipeline import solve_torn_pieces
+    from .solve.torn import TornResult, deskew_pieces, evaluate_torn
     from .synth.shredders import torn_shred
     conds = {"clean, 14px tears": (Realism(), 14), "clean, 6px tears": (Realism(), 6),
              "noisy (no rotation)": (replace(Realism.noisy(), rotation_deg=0), 10),
-             "noisy + 0.4 deg rotation": (Realism.noisy(), 10)}
+             "noisy + 0.4 deg rotation": (Realism.noisy(), 10),
+             "noisy + 1.5 deg rotation": (replace(Realism.noisy(), rotation_deg=1.5), 10),
+             "noisy + 3 deg rotation": (replace(Realism.noisy(), rotation_deg=3.0), 10)}
     out = {}
     for name, (r, amp) in conds.items():
         for shape in ((2, 4), (3, 4)):
@@ -186,9 +189,15 @@ def torn_benchmark(seeds=range(20, 23), kinds=("memo", "letter", "photo", "handw
                 for seed in seeds:
                     page, _ = render_page(kind, seed)
                     pcs, t = torn_shred(page, *shape, amplitude=amp, seed=seed, realism=r)
-                    res = assemble(pcs)
+                    rec = solve_torn_pieces(pcs)
+                    rot = rec.extra.get("rotations") or {}
+                    if rot:
+                        pcs = deskew_pieces(pcs, [rot.get(p.id, 0.0) for p in pcs])
+                    ids = [p.id for p in pcs]
+                    res = TornResult({ids.index(k): tuple(v) for k, v in rec.extra["positions"].items()}, [], [], 0)
                     m = evaluate_torn(pcs, res, t)
-                    m["runtime_s"] = res.runtime_s
+                    m["deskewed"] = float(bool(rot))
+                    m["runtime_s"] = rec.runtime_s
                     ms.append(m)
             out[f"{name} {shape[0]}x{shape[1]}"] = {k: float(np.mean([m[k] for m in ms])) for k in ms[0]}
     return out

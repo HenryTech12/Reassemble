@@ -309,7 +309,7 @@ def render_png(job_id: str, doc: int, heatmap: bool = False) -> Response:
         from reassemble.solve.torn import TornResult, render_torn
         ids = list(job.pieces)
         plist = [job.pieces[i] for i in ids]
-        img = render_torn(plist, TornResult({ids.index(k): tuple(v) for k, v in rec.extra["positions"].items()}, [], [], 0))
+        img = render_torn(plist, TornResult({ids.index(k): tuple(v) for k, v in rec.extra["positions"].items()}, [], [], 0), rotations=rec.extra.get("rotations"))
     else:
         img = render_strips(job.pieces, rec, heatmap=heatmap)
     buf = io.BytesIO()

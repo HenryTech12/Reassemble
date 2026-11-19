@@ -80,6 +80,8 @@ def _solve_2d(args, pieces, truth, shape) -> int:
     import json
     from pathlib import Path
 
+    import numpy as np
+
     from .pipeline import solve_grid_pieces, solve_torn_pieces
 
     out = Path(args.out)
@@ -95,8 +97,12 @@ def _solve_2d(args, pieces, truth, shape) -> int:
         if truth:
             result["metrics"] = evaluate_grid(rec.grid, truth["grid"])
     else:
-        from .solve.torn import TornResult, evaluate_torn, render_torn
+        from .solve.torn import TornResult, deskew_pieces, evaluate_torn, render_torn
         rec = solve_torn_pieces(pieces)
+        rot = rec.extra.get("rotations") or {}
+        if rot:  # positions refer to the deskewed pieces
+            pieces = deskew_pieces(pieces, [rot.get(p.id, 0.0) for p in pieces])
+            print(f"deskewed pieces from their text lines (median {np.median(np.abs(list(rot.values()))):.2f} deg)")
         ids = [p.id for p in pieces]
         tr = TornResult({ids.index(k): tuple(v) for k, v in rec.extra["positions"].items()}, [], [], 0)
         render_torn(pieces, tr).save(out / "reconstruction.png")
@@ -157,6 +163,12 @@ def cmd_train(args: argparse.Namespace) -> int:
     stats = train(args.out, n_pages=args.pages, epochs=args.epochs, seed=args.seed)
     Path(args.out).with_suffix(".json").write_text(json.dumps(stats, indent=1))
     print(f"saved {args.out} ({stats['seconds']:.0f}s)")
+    return 0
+
+
+def cmd_train_gaps(args: argparse.Namespace) -> int:
+    from .solve.joins import train_gap_model
+    print(train_gap_model(args.scorer, n_pages=args.pages, seed=args.seed))
     return 0
 
 
@@ -359,6 +371,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--epochs", type=int, default=6)
     s.add_argument("--seed", type=int, default=0)
     s.set_defaults(func=cmd_train)
+
+    s = sub.add_parser("train-gaps", help="train the missing-strip (gap) classifier")
+    s.add_argument("--scorer", default="handcrafted", choices=["handcrafted", "learned"])
+    s.add_argument("--pages", type=int, default=160)
+    s.add_argument("--seed", type=int, default=0)
+    s.set_defaults(func=cmd_train_gaps)
 
     s = sub.add_parser("finetune", help="fine-tune the matcher on corrections exported from the editor")
     s.add_argument("corrections", help="JSON list of {case, left, right, label}")
