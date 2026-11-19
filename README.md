@@ -16,8 +16,10 @@ people fix what the solver gets wrong.
 * Strips photographed on the capture mat and segmented automatically: **100 %** of pieces
   found, 83 % of neighbours correct.
 * Mixed bins of 3 shredded pages: **95 %** clustering purity.
-* Torn paper (upright pieces): **100 %**. Cross-cut: good up to about 4×3 pieces, poor
-  beyond that (honest table below).
+* Torn paper: **100 %** for upright pieces. Rotated pieces are deskewed from their own text
+  lines: at ±3° rotation, 0.08 → 0.54.
+* Missing strips flagged by a learned classifier: 0.70 recall at 0.86 precision (CNN scorer).
+* Cross-cut: good up to about 4×3 pieces, poor beyond that (honest table and analysis below).
 
 > **Ethics.** Reassemble is for recovering your own documents, testing your organisation's
 > shredders, archives and education. Don't use it on documents you have no right to access.
@@ -29,7 +31,7 @@ people fix what the solver gets wrong.
 ```bash
 make setup          # venv + Python deps + CPU PyTorch (needs `uv`; also: sudo apt-get install tesseract-ocr)
 make demo           # shred a letter, solve it, open result/demo/index.html
-make test           # 57 tests, ~1 min
+make test           # 63 tests, ~1 min
 make api            # FastAPI on :8000      ┐  then open http://localhost:3000
 make web            # Next.js on :3000      ┘  and press "Try" on a sample
 make docker         # or: both services via docker compose
@@ -47,6 +49,7 @@ reassemble audit samples/letter_30_noisy --out result/audit.pdf   # shredder sec
 reassemble archive <dir-of-bins> --out result/archive             # batch mode + dashboard
 reassemble bench --suite strips|mixed|double|ocr|crosscut|torn|scorers|capture
 reassemble train                                     # retrain the CNN (~2.5 min on CPU)
+reassemble train-gaps --scorer learned               # retrain the missing-strip classifier
 reassemble finetune corrections.json                 # learn from editor corrections
 reassemble mat                                       # printable capture mat PDF
 ```
@@ -122,8 +125,18 @@ scores. Everything serialises to JSON for the API.
    that join is forbidden and the rest is re-optimised. A join can look only slightly better
    than the alternatives locally and still be forced by the rest of the solution, so this
    works far better than a local best-vs-second-best ratio.
-6. **Gap detection** flags a join as a probable missing strip when its cost is ≥1.5× the
-   median join cost *and* neither piece prefers the other (ratio-normalised cost > 1.2).
+6. **Gap detection** (missing strips) uses a small **learned classifier** (gradient
+   boosting, `solve/joins.py`, one model per scorer). For each join of the solution it
+   looks at:
+   * cost relative to the page's typical join and to its neighbouring joins;
+   * cost relative to the best alternatives, and its rank in both directions;
+   * the min-marginal confidence;
+   * how much ink touches both edges (a blank seam can't reveal a gap).
+
+   It is trained on generator pages (10–60 strips, clean and noisy) with 0–3 strips
+   removed: `reassemble train-gaps`, about 2 min for the handcrafted scorer and 8 min for
+   the CNN. The first version, a hand-tuned two-threshold rule, is kept as a fallback when
+   no model file exists.
 
 ## Results
 
@@ -199,6 +212,23 @@ Pidgin and Yoruba ship as small starter lists).
 OCR adds about 2–3 s per page. The best candidate in the list would score 0.941, so OCR
 picks almost optimally; what limits it is how good the candidate list is.
 
+**Local English language model** (`verify/lm.py`, `models/char_lm_en.json.gz`, 430 KB).
+It is a character 5-gram model with Witten–Bell interpolation. It is trained in about 90 s
+on 5.4 M characters of English prose taken from the docstrings of installed Python
+packages (deliberately **not** on the generator's sentences). It runs offline, with no API
+and no GPU. It cleanly separates real text from seam damage: −2.7 bits/char for a correct
+sentence, −4.6 when words are split ("the commit tee has rev iewed"), and −7.5 for garbled
+OCR. In the rerank it adds `0.3 × log-prob/char` to readability.
+
+Measured honestly, on held-out seeds 200–205 with the weight tuned on seeds 100–105, it
+**changed no decisions**. The dictionary-based rerank already picks the best candidate
+every time (0.937, equal to the oracle), and widening the list to 20 candidates only lifts
+that ceiling to 0.940. The remaining errors can't be fixed by undoing one join, so a better
+scorer can't reach them. The LM stays on because it is neutral here and may help on real
+documents with richer language. I also tried it for ordering cross-cut *rows* (does row
+A's last line continue into row B's first line?), and it was near chance (see Phase 4).
+English only for now.
+
 **Two-sided matching.** When back images exist, the back-side seam cost is added. The back
 is stored as you would read it, so "B is right of A on the front" means "A.back is right of
 B.back": the back cost matrix is simply **transposed**. Noisy 40-strip double-sided pages,
@@ -266,8 +296,16 @@ with some ink); blank patches are skipped.
 
 With the learned scorer, the standard benchmark (`reassemble bench --scorer learned`,
 4 pages × 5 types) reaches **1.000 content-neighbour accuracy** on clean, noisy and
-noisy-with-2-missing-strips pages. Gap detection improves from 0.14 recall / 0.20 precision
-to **0.40 / 0.70**. The cost is speed: about 3 s per 30-strip page on CPU instead of
+noisy-with-2-missing-strips pages. Gap detection (missing strips, noisy pages, 2 removed):
+
+| gap detector | recall | precision | content accuracy on intact pages |
+|---|---|---|---|
+| hand-tuned rule, handcrafted scorer | 0.14 | 0.20 | 0.961 |
+| **learned classifier**, handcrafted scorer | **0.28** | **0.42** | 0.958 |
+| hand-tuned rule, CNN scorer | 0.38 | 0.68 | 1.000 |
+| **learned classifier**, CNN scorer | **0.70** | **0.86** | 0.998 |
+
+The last column checks the cost of false alarms on pages with nothing missing. The cost is speed: about 3 s per 30-strip page on CPU instead of
 about 0.7 s. "Combined" (average of the two normalised costs) never beat the CNN alone.
 
 ## Phase 4: harder shred types
@@ -294,9 +332,24 @@ better than the truth. Clean letters and memos, 3 seeds each:
 Honest assessment: this is the weakest part of the project. Left/right matching is decent
 (top-1 about 0.75), but **top/bottom matching is poor** (top-1 about 0.2). About half of
 all horizontal cuts fall in the blank space between text lines, so there's nothing to
-match. A text-line-*phase* cue is implemented (`line_phase_cost`) but gave no consistent
-gain, so it is off by default. The CNN wasn't better on cross-cut either; it was trained
-only on vertical seams.
+match.
+
+A second round of fixes, all measured and all **not adopted** because none helped:
+
+| idea | what it measures | result |
+|---|---|---|
+| text-line *phase* across a cut (`line_phase_cost`) | do lines continue with the page's line spacing? | no consistent gain |
+| stack rows by *raw* instead of ratio-normalised summed TB cost | — | worse (0.29–0.50 vs 0.43–0.65 next-row top-1) |
+| line phase measured on whole assembled rows | — | 0.31–0.43 next-row top-1 |
+| local LM: does row A's last line continue into row B's first? | sentence continuity | near chance (0–0.4) |
+| CNN scorer for the 2D costs | — | no better; it was trained on vertical seams only |
+
+The diagnosis is structural. Text lines span the whole page, so when a horizontal cut falls
+between two lines it is blank across the **entire row**, and no per-piece or per-row
+pixel cue can see through it. Even when given *perfectly assembled rows*, picking the next
+row is right only 33–80 % of the time. A real fix would need page-level reasoning
+(paragraph layout, margins, reading order with a much stronger language model). That is
+future work.
 
 **Torn paper**, `reassemble/solve/torn.py`. A tear is a shared curve. If B sits at offset
 (dx, dy) to the right of A, then `x_A(y) + 1 − x_B(y − dy)` must be constant across the
@@ -312,6 +365,27 @@ merge that would make pieces overlap is rejected.
 | clean, subtle 6 px tears | 1.000 | 1.000 |
 | noisy (no rotation) | 1.000 | 1.000 |
 | noisy + ±0.4° rotation | 0.558 | 0.613 |
+
+**Rotated torn pieces.** A real photo never has pieces perfectly upright. Each piece is now
+deskewed *on its own* from its text lines (`text_angle`, classic projection-profile
+deskew: the angle at which the ink's horizontal profile is sharpest). Then the exact
+upright assembler runs. This only kicks in when the median measured skew is above 0.4°,
+since below that the estimation error (about 0.15°) is as big as the rotation. Same pages
+and seeds, before → after:
+
+| rotation | 2×4 pieces | 3×4 pieces |
+|---|---|---|
+| ±0.4° | 0.47 → 0.49 | 0.63 → 0.63 |
+| ±1.5° | 0.28 → **0.53** | 0.32 → **0.62** |
+| ±3° | 0.12 → **0.48** | 0.08 → **0.54** |
+
+This is a real improvement but not a full fix: residual angle errors of a few tenths of a
+degree still break about half the matches. Approaches that failed and are kept in the code
+as documentation:
+* chaining *relative* angles from tear-edge tilts along a spanning tree: errors accumulate,
+  and rotated straight page edges produced perfect bogus matches until a straightness
+  test (`_straight`) excluded them;
+* least squares over all confident relations: wrong matches pollute it.
 
 **Handwriting and photos.** The baseline cue is weighted by each strip's text-line
 regularity, so it fades out for handwriting and photos, and the pixel/CNN seam cost carries
@@ -460,15 +534,18 @@ reported and skipped; it doesn't stop the run.
 * **Monospace fonts** are hard. In a monospaced page, the whitespace between characters
   lines up vertically across every line, so many cuts land in blank columns (about 0.68
   content accuracy on that seed).
-* **Gap (missing strip) detection is weak**: about 0.15–0.6 recall depending on the page
-  type. It works on handwriting, but on smooth photos the gradient extrapolates across a
-  missing strip almost seamlessly.
+* **Gap detection** is now decent with the CNN scorer (0.70 recall / 0.86 precision) but
+  still modest with the handcrafted one (0.28 / 0.42). Smooth photos remain the hardest
+  case: a gradient extrapolates across a missing strip almost seamlessly.
 * Noisy **invoices** are the hardest printed case (0.84). Their table rules repeat the same
   pattern on many strips.
-* **Torn pieces must be upright.** The shape matcher has no rotation search, so ±0.4° of
-  rotation drops accuracy to about 0.6. (Strips are deskewed by PCA; torn pieces have no
-  long axis to deskew by.)
-* **Cross-cut beyond about 6×5 pieces** is mostly wrong (see the table above).
+* **Rotated torn pieces** are only partly solved: deskewing from text lines brings ±1.5–3°
+  rotations from 0.1–0.3 up to 0.5–0.6, but not to the 1.00 of upright pieces. Pieces
+  without text lines (photos) borrow the median angle of the others.
+* **Cross-cut beyond about 6×5 pieces** is mostly wrong. Four further ideas were tried
+  and measured without gain (see Phase 4); the limit is structural.
+* **The local language model** measurably changed nothing on the benchmark (see Phase 2).
+  It is English only.
 * The document clustering can split off a few blank margin strips as an extra "document"
   (seen on a captured photo in archive mode).
 * **Web editor**: dragging, locking and splitting are implemented for strip shreds. Cross-cut
@@ -476,7 +553,9 @@ reported and skipped; it doesn't stop the run.
   and don't survive an API restart.
 * **Capture** assumes strips are laid roughly upright (within ±45°). A strip that is upside
   down can't be told apart, and capture is not yet tuned on real photos; the mat, threshold
-  and erosion values were chosen on simulated ones.
+  and erosion values were chosen on simulated ones. **Next step needs a person:** print
+  `assets/capture_mat.pdf`, photograph real strips on it, and run
+  `reassemble capture photo.jpg --out pieces/ && reassemble solve pieces/`.
 * Mixed bins: two pages built from the *same template* (two memos) have nearly identical
   line layouts and can merge into one cluster. The number of documents is right about 75 %
   of the time; when it's wrong, it's usually over-segmentation.
