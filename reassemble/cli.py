@@ -239,6 +239,51 @@ def cmd_mat(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    import numpy as np
+    from PIL import Image
+
+    from .model import load_case
+    from .product.audit import audit, audit_dict, report_pdf
+
+    src = Path(args.input)
+    if src.is_file():
+        import cv2
+        from .capture.pipeline import capture
+        pieces, _ = capture(cv2.imread(str(src), cv2.IMREAD_COLOR))
+        dpi = args.dpi * 2  # capture works at 2x
+    else:
+        pieces, _ = load_case(src)
+        dpi = args.dpi
+    original = None
+    if args.original:
+        original = np.array(Image.open(args.original).convert("RGB"))
+    elif src.is_dir() and (src / "original.png").exists():
+        original = np.array(Image.open(src / "original.png").convert("RGB"))
+    res, img = audit(pieces, dpi=dpi, original=original)
+    out = Path(args.out)
+    report_pdf(res, img, out)
+    out.with_suffix(".json").write_text(json.dumps(audit_dict(res), indent=1))
+    print(res.verdict)
+    print(f"  {res.level}; {res.n_pieces} pieces, width {res.piece_width_mm} mm, solved in {res.seconds}s")
+    if res.text_recovered_pct is not None:
+        print(f"  text recovered vs original: {res.text_recovered_pct:.0%}")
+    print(f"  {res.advice}")
+    print(f"wrote {out}")
+    return 0
+
+
+def cmd_archive(args: argparse.Namespace) -> int:
+    from .product.archive import process_archive
+    r = process_archive(args.input, args.out)
+    ok = sum(b["status"] == "done" for b in r["bins"])
+    print(f"{ok}/{len(r['bins'])} bins reconstructed in {r['seconds']:.0f}s -> {args.out}/index.html, archive.pdf")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="reassemble", description="Reassemble shredded documents.")
     sub = p.add_subparsers(dest="command", required=True)
@@ -266,6 +311,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--scale", type=float, default=2.0, help="mat-frame resolution (2 = ~200 dpi)")
     s.add_argument("--out-scale", type=float, default=1.0, help="resize output pieces")
     s.set_defaults(func=cmd_capture)
+
+    s = sub.add_parser("audit", help="shredder security audit with a one-page PDF report")
+    s.add_argument("input", help="case folder of pieces, or a photo on the capture mat")
+    s.add_argument("--out", default="result/audit.pdf")
+    s.add_argument("--dpi", type=float, default=100.0, help="scan resolution of the pieces")
+    s.add_argument("--original", help="optional image of the original page, for exact % recovered")
+    s.set_defaults(func=cmd_audit)
+
+    s = sub.add_parser("archive", help="batch-reconstruct many bins into PDFs with a progress dashboard")
+    s.add_argument("input", help="directory of bins (case folders or photos)")
+    s.add_argument("--out", default="result/archive")
+    s.set_defaults(func=cmd_archive)
 
     s = sub.add_parser("mat", help="write the printable capture-mat PDF")
     s.add_argument("--out", default="assets/capture_mat.pdf")

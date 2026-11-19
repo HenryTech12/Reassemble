@@ -36,7 +36,8 @@ reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR re
 | 4 | Cross-cut 2D solver, torn-paper shape matching, handwriting/photos | ✅ (cross-cut: partial) |
 | 5 | Real-world capture (photo → pieces), capture mat, simulated test photo | ✅ |
 | 6 | FastAPI + WebSocket backend, Next.js editor with heatmap, replay, constrained re-solve, collaboration | ✅ |
-| 7–8 | product angles, polish | in progress |
+| 7 | Shredder security audit (PDF report), archive batch mode | ✅ |
+| 8 | Polish: README, `make demo`, Docker | in progress |
 
 ## How it works (strip shreds)
 
@@ -354,6 +355,36 @@ An end-to-end browser test (Playwright, two simulated users) covered: load a sam
 see both users online, drag a strip, read OCR, lock a seam and re-solve. It produced no
 console errors.
 
+## Phase 7: product angles
+
+**Shredder security audit.** Feed in the output of *your own* shredder: a folder of
+scanned pieces, or one photo on the capture mat.
+
+```bash
+reassemble audit samples/letter_30_noisy --out result/audit.pdf
+# UNSAFE: 98% of the text was recovered automatically in 6 s.
+#   strip-cut (~DIN 66399 P-1/P-2); 30 pieces, width 8.6 mm, solved in 5.6s
+#   Strip-cut shredders are unsafe for sensitive documents. Use cross-cut (P-4) or micro-cut (P-5+).
+```
+
+The audit reconstructs the pile, OCRs the result, and reports particle size, time taken,
+mean join confidence, readability, and **% of text recovered**. That last figure is exact
+(word overlap with the OCR of the original) when you pass `--original` or the case has an
+`original.png`, and estimated otherwise. It then gives a plain-language verdict in the
+spirit of DIN 66399. A large-particle cross-cut (10×12 pieces of 18 mm) was also flagged
+**UNSAFE, 52 % of text recovered**, even though the 2D solver assembled it poorly. Pieces
+that big contain whole words on their own, and that is precisely the security point.
+
+<img src="assets/audit_report-1.png" width="330" alt="audit report">
+
+**Archive mode.** `reassemble archive <dir> --out result/archive` treats every entry as
+one bin: a case folder or a photo. It reconstructs each bin, separating mixed documents,
+and writes a PDF per bin plus `archive.pdf` with every page. Along the way it keeps a
+self-refreshing `index.html` dashboard and a `status.json` up to date. A broken bin is
+reported and skipped; it doesn't stop the run.
+
+![archive dashboard](assets/screenshot_archive.png)
+
 ## Known limitations (honest list)
 
 * **Blank strips** can't be ordered. They are placed at the margins, but which blank strip
@@ -370,6 +401,8 @@ console errors.
   rotation drops accuracy to about 0.6. (Strips are deskewed by PCA; torn pieces have no
   long axis to deskew by.)
 * **Cross-cut beyond about 6×5 pieces** is mostly wrong (see the table above).
+* The document clustering can split off a few blank margin strips as an extra "document"
+  (seen on a captured photo in archive mode).
 * **Web editor**: dragging, locking and splitting are implemented for strip shreds. Cross-cut
   and torn results are shown read-only. Jobs live in server memory (plus `runs/` on disk)
   and don't survive an API restart.
