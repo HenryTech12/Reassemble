@@ -25,7 +25,7 @@ def cmd_solve(args: argparse.Namespace) -> int:
 
     from .metrics import evaluate_strips
     from .model import load_case
-    from .pipeline import SolveOptions, prepare, solve_prepared
+    from .pipeline import SolveOptions, prepare, solve_mixed, solve_prepared
     from .render.compose import render_strips
 
     pieces, truth = load_case(args.case)
@@ -33,15 +33,29 @@ def cmd_solve(args: argparse.Namespace) -> int:
         print(f"no pieces found in {args.case}")
         return 1
     opts = SolveOptions(methods=tuple(args.methods.split(",")), beam_width=args.beam,
-                        scorer=args.scorer, ocr_rerank=args.ocr)
+                        scorer=args.scorer, ocr_rerank=args.ocr, langs=args.lang)
     prep = prepare(pieces)
-    rec = solve_prepared(prep, opts, progress=(lambda e: print("  ..", e["stage"])) if args.verbose else None)
+    prog = (lambda e: print("  ..", e["stage"])) if args.verbose else None
+    mixed = args.mixed or (truth or {}).get("kind") == "mixed"
+    rec = solve_mixed(prep, opts, k=args.docs, progress=prog) if mixed else solve_prepared(prep, opts, prog)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     by_id = {p.id: p for p in prep.pieces}
+    from .model import Reconstruction
+    if rec.documents:
+        for d in rec.documents:
+            r = Reconstruction.from_dict(d)
+            render_strips(by_id, r).save(out / f"reconstruction_doc{d['doc']}.png")
+            render_strips(by_id, r, heatmap=True).save(out / f"heatmap_doc{d['doc']}.png")
+        print(f"found {len(rec.documents)} document(s)")
     render_strips(by_id, rec).save(out / "reconstruction.png")
     render_strips(by_id, rec, heatmap=True).save(out / "heatmap.png")
     result = rec.to_dict()
+    if truth and truth.get("kind") == "mixed":
+        from .metrics import evaluate_mixed
+        result["metrics"] = evaluate_mixed(rec.documents, truth, prep.blank)
+        print("mixed: " + ", ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}"
+                                    for k, v in result["metrics"].items()))
     print(f"solved {len(pieces)} pieces with {rec.method} in {rec.runtime_s:.2f}s, "
           f"{len(rec.gaps)} gap(s) detected")
     if truth and truth.get("kind") == "strip":
@@ -57,8 +71,20 @@ def cmd_solve(args: argparse.Namespace) -> int:
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
+    from . import bench as B
     from .bench import print_table, strip_benchmark
     from .pipeline import SolveOptions
+
+    if args.suite == "mixed":
+        for k in (2, 3, 5):
+            print_table(B.mixed_benchmark(k))
+        return 0
+    if args.suite == "double":
+        print_table(B.double_sided_benchmark())
+        return 0
+    if args.suite == "ocr":
+        print_table(B.ocr_benchmark())
+        return 0
 
     seeds = range(args.seed, args.seed + args.seeds)
     for noisy, drop, label in [(False, 0, "clean"), (True, 0, "noisy"), (True, 2, "noisy, 2 missing")]:
@@ -90,10 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--beam", type=int, default=200, help="beam width")
     s.add_argument("--scorer", default="handcrafted", choices=["handcrafted", "learned", "combined"])
     s.add_argument("--ocr", action="store_true", help="rerank top candidates with OCR")
+    s.add_argument("--lang", default="en", help="word lists for OCR, e.g. en,pcm,yo")
+    s.add_argument("--mixed", action="store_true", help="pile may contain several documents")
+    s.add_argument("--docs", type=int, default=None, help="number of documents (default: auto)")
     s.add_argument("-v", "--verbose", action="store_true")
     s.set_defaults(func=cmd_solve)
 
     s = sub.add_parser("bench", help="benchmark strip reconstruction on fresh synthetic pages")
+    s.add_argument("--suite", default="strips", choices=["strips", "mixed", "double", "ocr"])
     s.add_argument("-n", type=int, default=30)
     s.add_argument("--seeds", type=int, default=5)
     s.add_argument("--seed", type=int, default=100)

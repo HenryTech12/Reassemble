@@ -32,6 +32,9 @@ class SolveOptions:
     ocr_rerank: bool = False
     normalize: bool = False               # solve on ratio-normalised costs instead of raw
     park_blanks: bool = True
+    ocr_candidates: int = 8
+    ocr_alpha: float = 0.05
+    langs: str = "en"
     scorer_cfg: ScorerConfig = field(default_factory=ScorerConfig)
 
 
@@ -42,9 +45,16 @@ class Prepared:
     back_feats: list[EdgeFeatures] | None
     ids: list[str]
 
+    def is_blank(self, i: int) -> bool:
+        """No ink on the front (and on the back, for double-sided pieces)."""
+        front = self.feats[i].ink_fraction < 0.002
+        if self.back_feats is None:
+            return front
+        return front and self.back_feats[i].ink_fraction < 0.002
+
     @property
     def blank(self) -> set[str]:
-        return {f.id for f in self.feats if f.ink_fraction < 0.002}
+        return {self.ids[i] for i in range(len(self.ids)) if self.is_blank(i)}
 
 
 def prepare(pieces: list[Piece]) -> Prepared:
@@ -89,8 +99,8 @@ def solve_prepared(prep: Prepared, opts: SolveOptions | None = None,
     # Blank strips (pure margin) carry no information, so we take them out of the
     # optimisation and park them at the page edges afterwards.
     in_lock = {i for pair in locked for i in pair}
-    blank_idx = [i for i, f in enumerate(prep.feats)
-                 if f.ink_fraction < 0.002 and i not in in_lock] if opts.park_blanks else []
+    blank_idx = [i for i in range(len(prep.ids))
+                 if prep.is_blank(i) and i not in in_lock] if opts.park_blanks else []
     content = [i for i in range(len(prep.ids)) if i not in set(blank_idx)]
     if len(content) < 2:
         content, blank_idx = list(range(len(prep.ids))), []
@@ -111,21 +121,43 @@ def solve_prepared(prep: Prepared, opts: SolveOptions | None = None,
     extra: dict = {"methods": {k: {"cost": v.cost, "runtime_s": v.runtime_s,
                                    "order": [prep.ids[i] for i in v.order]}
                                for k, v in res.items() if k != "best"}}
-    if opts.ocr_rerank and "beam" in res:
-        from .verify.rerank import rerank_candidates
-        cands = [(c, o) for c, o in res["beam"].alternatives]
-        if res["best"].order not in [o for _, o in cands]:
-            cands.insert(0, (best.cost, best.order))
+    if opts.ocr_rerank:
+        from .verify.rerank import candidate_orders, rerank_candidates
+        # alternatives are generated on the content-only problem, so that swapping two
+        # interchangeable blank strips doesn't count as an "alternative"
+        lk = [(sub[a], sub[b]) for a, b in locked if a in sub and b in sub]
+        Ms = build_atsp(S[np.ix_(content, content)], bscale * lin[content],
+                        bscale * rin[content], lk)
+        ns = len(content)
+        best_sub = [sub[i] for i in best.order if i in sub]
+        cands = candidate_orders(Ms, [ns] + best_sub, ns, k=opts.ocr_candidates)
+        cands = [(c, full(o)) for c, o in cands]
         emit({"stage": "ocr_rerank", "candidates": len(cands)})
-        chosen_order, rr = rerank_candidates(prep, cands)
+        chosen_order, rr = rerank_candidates(prep, cands, opts.langs, opts.ocr_alpha,
+                                             scale=float(np.median(S[S < 1e5])))
         extra["ocr_rerank"] = rr
     emit({"stage": "solved", "order": [prep.ids[i] for i in chosen_order]})
     lin_b, rin_b = bscale * lin, bscale * rin
     rec = build_reconstruction(prep, chosen_order, D, opts, locked, start=lin_b, end=rin_b)
     rec.method = best.method + ("+ocr" if opts.ocr_rerank else "")
+    if opts.ocr_rerank and "ocr_rerank" in extra:
+        flag_ocr_suspects(prep, rec, extra["ocr_rerank"].pop("words"), opts.langs)
     rec.runtime_s = time.perf_counter() - t0
     rec.extra.update(extra)
     return rec
+
+
+def flag_ocr_suspects(prep: Prepared, rec: Reconstruction, words: list[dict], langs: str) -> None:
+    """Mark joins crossed by several non-dictionary words (``ocr_suspect`` count)."""
+    from .render.compose import strip_layout
+    from .verify.ocr import suspicious_joins
+
+    layout = strip_layout({p.id: p for p in prep.pieces}, rec.order)
+    x_of = {l["id"]: l["x"] for l in layout if l["id"]}
+    seams = {f"{j['left']}|{j['right']}": x_of[j["right"]] for j in rec.joins if j["right"] in x_of}
+    sus = suspicious_joins(words, seams, langs)
+    for j in rec.joins:
+        j["ocr_suspect"] = sus.get(f"{j['left']}|{j['right']}", 0)
 
 
 def park_blanks(order: list[int], blanks: list[int], feats: list[EdgeFeatures]) -> list[int]:
@@ -164,7 +196,7 @@ def build_reconstruction(prep: Prepared, order: list[int], D: np.ndarray, opts: 
     tour = [len(D)] + list(order)
     mm = np.array(join_min_marginals(M, tour))[1:n]  # edges between consecutive pieces
     content_costs = [c for (a, b), c in zip(zip(order, order[1:]), costs)
-                     if prep.feats[a].ink_fraction >= 0.002 or prep.feats[b].ink_fraction >= 0.002]
+                     if not (prep.is_blank(a) and prep.is_blank(b))]
     scale = 0.08 * float(np.median(content_costs)) if content_costs else 1.0
     confs = 1.0 - np.exp(-mm / max(scale, 1e-9))
     locked_set = set(locked_idx)
@@ -198,3 +230,44 @@ def build_reconstruction(prep: Prepared, order: list[int], D: np.ndarray, opts: 
 def solve_pieces(pieces: list[Piece], opts: SolveOptions | None = None,
                  progress: Progress | None = None) -> Reconstruction:
     return solve_prepared(prepare(pieces), opts, progress)
+
+
+def subset(prep: Prepared, idx: list[int]) -> Prepared:
+    return Prepared([prep.pieces[i] for i in idx], [prep.feats[i] for i in idx],
+                    [prep.back_feats[i] for i in idx] if prep.back_feats else None,
+                    [prep.ids[i] for i in idx])
+
+
+def solve_mixed(prep: Prepared, opts: SolveOptions | None = None, k: int | None = None,
+                progress: Progress | None = None, labels: list[int] | None = None) -> Reconstruction:
+    """Cluster pieces into documents, then solve each document separately.
+
+    ``labels`` lets a caller (the web editor) override the clustering, e.g. after a user
+    moved a piece to another document.
+    """
+    from .cluster.documents import cluster_documents
+
+    t0 = time.perf_counter()
+    emit = progress or (lambda e: None)
+    if labels is None:
+        lab, info = cluster_documents(prep.feats, k=k)
+    else:
+        lab, info = np.asarray(labels), {"k": len(set(labels)), "method": "user"}
+    emit({"stage": "clustered", "k": int(info["k"])})
+    docs = []
+    for d in sorted(set(lab.tolist())):
+        idx = [i for i in range(len(lab)) if lab[i] == d]
+        rec = solve_prepared(subset(prep, idx), opts)
+        doc = rec.to_dict()
+        doc["doc"] = int(d)
+        doc["pieces"] = [prep.ids[i] for i in idx]
+        docs.append(doc)
+        emit({"stage": "document_solved", "doc": int(d), "order": rec.order})
+    docs.sort(key=lambda x: -len(x["pieces"]))
+    main = Reconstruction.from_dict(docs[0])
+    main.documents = docs
+    main.method = (docs[0].get("method") or "") + "+cluster"
+    main.runtime_s = time.perf_counter() - t0
+    main.extra["clustering"] = {k_: v for k_, v in info.items() if k_ != "silhouette"}
+    main.extra["labels"] = {prep.ids[i]: int(lab[i]) for i in range(len(lab))}
+    return main

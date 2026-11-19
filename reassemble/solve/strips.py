@@ -238,7 +238,7 @@ def or_opt_2opt(M: np.ndarray, tour: list[int], max_rounds: int = 500) -> list[i
     return [int(x) for x in t]
 
 
-def join_min_marginals(M: np.ndarray, tour: list[int]) -> list[float]:
+def join_min_marginals(M: np.ndarray, tour: list[int], return_tours: bool = False):
     """For every edge of ``tour``: how much the best tour cost rises if that edge is banned.
 
     This is a far better confidence signal than comparing a pair with its alternatives in
@@ -248,14 +248,15 @@ def join_min_marginals(M: np.ndarray, tour: list[int]) -> list[float]:
     current tour.
     """
     base = tour_cost(M, tour)
-    out = []
+    out, tours = [], []
     for k in range(len(tour)):
         a, b = tour[k], tour[(k + 1) % len(tour)]
         M2 = M.copy()
         M2[a, b] = BIG
         t2 = or_opt_2opt(M2, tour)
         out.append(max(0.0, tour_cost(M2, t2) - base))
-    return out
+        tours.append(t2)
+    return (out, tours) if return_tours else out
 
 
 # --------------------------------------------------------------------------- driver

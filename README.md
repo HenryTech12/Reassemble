@@ -17,7 +17,8 @@ make setup          # venv + Python deps (needs `uv`; also: sudo apt-get install
 make test           # run the test suite
 make demo-synth     # generate every synthetic test case into samples/
 reassemble solve samples/memo_30_noisy --out result/   # or: python -m reassemble.cli solve ...
-reassemble bench    # accuracy benchmark on fresh synthetic pages
+reassemble bench    # accuracy benchmark on fresh synthetic pages (--suite strips|mixed|double|ocr)
+reassemble solve samples/mixed_3 --out result/mixed --ocr   # mixed bin + OCR rerank
 ```
 
 `solve` writes `reconstruction.png`, `heatmap.png` (joins coloured by confidence) and
@@ -29,7 +30,8 @@ reassemble bench    # accuracy benchmark on fresh synthetic pages
 |---|---|---|
 | 0 | Synthetic data generator + digital shredders | ✅ |
 | 1 | Strip reconstruction MVP | ✅ |
-| 2–8 | OCR, two-sided, mixed bins, learned matcher, cross-cut, capture, web app, ... | in progress |
+| 2 | OCR verification & rerank, two-sided matching, mixed-document separation, gap placeholders | ✅ |
+| 3–8 | learned matcher, cross-cut, torn, capture, web app, ... | in progress |
 
 ## How it works (strip shreds)
 
@@ -117,6 +119,56 @@ and confidence computation.
 | unsharp-mask before matching (only when the scan is blurry) | 0.63 → 0.96 |
 | solve on raw costs instead of ratio-normalised ones | ratios of near-zero costs are unstable on blank edges |
 
+## Phase 2: quality features
+
+**OCR verification** (`--ocr`, Tesseract). The pixel matcher only ever sees one seam at a
+time, while OCR sees the whole page. The candidate list is the best order plus, for each
+join, the re-optimised order with that join forbidden (the same computation as the
+confidence), deduplicated and cut to 8. Each candidate is rendered and OCR'd in parallel and
+scored by *readability* = 0.6 × fraction of tokens that are dictionary words + 0.4 × mean
+OCR confidence. The winner maximises `readability − α·(extra seam cost)`. Joins crossed by
+several non-words are flagged as `ocr_suspect` for the editor. Word lists live in
+`reassemble/verify/wordlists/`, and you choose them with `--lang en,pcm,yo` (Nigerian
+Pidgin and Yoruba ship as small starter lists).
+
+| noisy pages (memo, letter, invoice, handwriting × 6 seeds) | neighbour | neighbour (content) | direct (content) |
+|---|---|---|---|
+| without OCR | 0.813 | 0.916 | 0.757 |
+| **with OCR rerank** | **0.833** | **0.939** | **0.796** |
+
+OCR adds about 2–3 s per page. The best candidate in the list would score 0.941, so OCR
+picks almost optimally; what limits it is how good the candidate list is.
+
+**Two-sided matching.** When back images exist, the back-side seam cost is added. The back
+is stored as you would read it, so "B is right of A on the front" means "A.back is right of
+B.back": the back cost matrix is simply **transposed**. Noisy 40-strip double-sided pages,
+10 seeds:
+
+| | neighbour | neighbour (content) | direct (content) |
+|---|---|---|---|
+| front only | 0.759 | 0.864 | 0.485 |
+| **front + back** | **0.849** | **0.976** | **0.618** |
+
+**Mixed-document separation** (`solve --mixed`, automatic for mixed cases). All strips of
+one page have their text lines at the same heights, so the main cue is the correlation of
+smoothed "inside a text line" row profiles: about 0.25 distance within a page versus about
+0.9 across pages. Strips are linked to their 4 nearest neighbours when the distance is
+< 0.55. Connected components become documents, so the number of documents doesn't have to
+be guessed; components that are still similar on median get merged. Blank strips are
+assigned by *paper chromaticity* (r,g,b)/(r+g+b), which ignores scan brightness but keeps
+the paper's tint. Each document is then solved on its own. Noisy bins, 8 seeds each:
+
+| bin | purity | #docs found correctly | per-document neighbour (content) |
+|---|---|---|---|
+| 2 pages | 0.981 | 75 % | 0.817 |
+| **3 pages** | **0.949** ✅ | 75 % | 0.800 |
+| 5 pages | 0.890 | 63 % | 0.805 |
+
+(Silhouette-based agglomerative clustering, the first attempt, got purity of only about
+1/k: one giant cluster plus singletons.)
+
+**Missing pieces** show up in renders as red hatched placeholders of median strip width.
+
 ## Known limitations (honest list)
 
 * **Blank strips** can't be ordered. They are placed at the margins, but which blank strip
@@ -129,6 +181,9 @@ and confidence computation.
   missing strip almost seamlessly.
 * Noisy **invoices** are the hardest printed case (0.84). Their table rules repeat the same
   pattern on many strips.
+* Mixed bins: two pages built from the *same template* (two memos) have nearly identical
+  line layouts and can merge into one cluster. The number of documents is right about 75 %
+  of the time; when it's wrong, it's usually over-segmentation.
 
 ## Project layout
 
@@ -138,6 +193,8 @@ reassemble/
   features/   deskew/normalise, edge reading, text-line features
   match/      pairwise edge costs
   solve/      greedy, beam search, ATSP local search, gap detection
+  verify/     Tesseract OCR readability, reranking, word lists (en, pcm, yo)
+  cluster/    mixed-bin document separation
   render/     assembled image + confidence heatmap
   metrics.py  neighbour / direct accuracy, gap precision/recall
   pipeline.py prepare -> score -> solve -> Reconstruction

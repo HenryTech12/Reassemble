@@ -76,3 +76,25 @@ def evaluate_strips(pred: list[str | None], truth: dict, blank: set[str] | None 
     if missing:
         out["gaps"] = gap_detection(pred, order, missing)
     return out
+
+
+def evaluate_mixed(rec_documents: list[dict], truth: dict, blank: set[str] | None = None) -> dict:
+    """Purity of the document split + neighbour accuracy of each recovered document.
+
+    Each predicted document is matched to the true document most of its pieces come from.
+    """
+    from collections import Counter
+
+    doc_of = truth["doc_of"]
+    total, pure, accs = 0, 0, []
+    for d in rec_documents:
+        pcs = d["pieces"]
+        c = Counter(doc_of[p] for p in pcs)
+        maj, cnt = c.most_common(1)[0]
+        total += len(pcs)
+        pure += cnt
+        tdoc = truth["documents"][maj]
+        accs.append(neighbour_accuracy(d["order"], tdoc["order"], tdoc.get("missing", []),
+                                       ignore=blank))
+    return {"purity": pure / max(total, 1), "n_docs_found": len(rec_documents),
+            "n_docs_true": len(truth["documents"]), "neighbour_content_mean": float(sum(accs) / len(accs))}
